@@ -7,3 +7,4 @@ pypdf
 python-dotenv
 langchain-google-genai
 psycopg2-binary
+langchain-postgres
