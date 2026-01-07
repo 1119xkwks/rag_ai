@@ -1,14 +1,20 @@
 import os
-from langchain_community.document_loaders import PyPDFLoader, DirectoryLoader
+from langchain_community.document_loaders import (
+    PyPDFLoader, DirectoryLoader, TextLoader, CSVLoader, 
+    UnstructuredExcelLoader, UnstructuredWordDocumentLoader, 
+    UnstructuredPowerPointLoader
+)
+from hwp_loader import HwpLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_postgres import PGVector
 from langchain_google_genai import GoogleGenerativeAIEmbeddings, ChatGoogleGenerativeAI
 from langchain_core.runnables import RunnablePassthrough
 from langchain_core.prompts import PromptTemplate
 from langchain_core.output_parsers import StrOutputParser
-from dotenv import load_dotenv
+from langchain_core.output_parsers import StrOutputParser
+import config  # 환경변수 로드
 
-load_dotenv()
+# load_dotenv() # config.py에서 처리됨
 
 class RAGManager:
     """
@@ -72,19 +78,54 @@ class RAGManager:
 
         print(f"[{self.data_dir}] 에서 문서를 로드 중입니다...")
         
-        # 1. 문서 로드 (PDF 파일 대상)
-        loader = DirectoryLoader(self.data_dir, glob="**/*.pdf", loader_cls=PyPDFLoader, show_progress=True)
-        documents = loader.load()
+        all_documents = []
         
-        if not documents:
-            print("로딩된 문서가 없습니다. data 폴더에 PDF 파일이 있는지 확인하세요.")
+        # 지원하는 확장자별 로더 매핑
+        # HWP는 olefile 필요, 나머지는 requirements.txt에 명시된 패키지 필요
+        loaders_map = {
+            ".pdf": PyPDFLoader,
+            ".txt": lambda p: TextLoader(p, encoding='utf-8', autodetect_encoding=True),
+            ".md": lambda p: TextLoader(p, encoding='utf-8', autodetect_encoding=True),
+            ".py": lambda p: TextLoader(p, encoding='utf-8', autodetect_encoding=True),
+            ".csv": lambda p: CSVLoader(p, encoding='utf-8'),
+            ".xlsx": UnstructuredExcelLoader,
+            ".xls": UnstructuredExcelLoader,
+            ".docx": UnstructuredWordDocumentLoader,
+            ".doc": UnstructuredWordDocumentLoader,
+            ".pptx": UnstructuredPowerPointLoader,
+            ".ppt": UnstructuredPowerPointLoader,
+            ".hwp": HwpLoader
+        }
+
+        # 디렉토리 순회
+        for root, dirs, files in os.walk(self.data_dir):
+            for file in files:
+                ext = os.path.splitext(file)[1].lower()
+                if ext in loaders_map:
+                    file_path = os.path.join(root, file)
+                    try:
+                        loader_cls = loaders_map[ext]
+                        # 람다 함수인 경우(TextLoader 등 설정이 필요한 경우)와 클래스인 경우 구분
+                        if callable(loader_cls) and not isinstance(loader_cls, type):
+                            loader = loader_cls(file_path)
+                        else:
+                            loader = loader_cls(file_path)
+                            
+                        docs = loader.load()
+                        all_documents.extend(docs)
+                        print(f"로드 성공: {file}")
+                    except Exception as e:
+                        print(f"로드 실패 ({file}): {e}")
+        
+        if not all_documents:
+            print("로딩된 문서가 없습니다. data 폴더에 지원하는 파일이 있는지 확인하세요.")
             return
 
-        print(f"총 {len(documents)}개의 문서를 로드했습니다.")
+        print(f"총 {len(all_documents)}개의 문서를 로드했습니다.")
 
         # 2. 텍스트 분할 (Chunking)
         text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
-        splits = text_splitter.split_documents(documents)
+        splits = text_splitter.split_documents(all_documents)
         
         print(f"문서를 {len(splits)}개의 청크(Chunk)로 분할했습니다.")
 

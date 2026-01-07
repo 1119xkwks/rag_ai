@@ -8,3 +8,13 @@ python-dotenv
 langchain-google-genai
 psycopg2-binary
 langchain-postgres
+fastapi
+uvicorn
+python-multipart
+unstructured
+markdown
+openpyxl
+python-docx
+python-pptx
+olefile
+networkx

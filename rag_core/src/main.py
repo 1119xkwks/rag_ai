@@ -1,9 +1,7 @@
 import os
-from dotenv import load_dotenv
+import config
 from rag_manager import RAGManager
-
-# .env 파일 로드 (환경변수 설정)
-load_dotenv()
+# load_dotenv() # config.py에서 처리됨
 
 def main():
     print("=== RAG AI 챗봇 (터미널 버전) ===")
