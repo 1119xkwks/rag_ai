@@ -1,0 +1,22 @@
+// SCSS와 Tailwind를 함께 사용할 수 있습니다.
+
+.chat-container {
+
+  // SCSS 기능: 중첩(Nesting)
+  .message-box {
+    // Tailwind 기능: @apply 지시어
+    @apply p-4 rounded-lg bg-gray-800 text-white shadow-lg;
+
+    &:hover {
+      @apply bg-gray-700; // scss 변수나 연산도 가능하지만 tailwind 유틸리티가 편리함
+    }
+
+    h1 {
+      @apply text-2xl font-bold mb-2 text-blue-400;
+    }
+
+    p {
+      @apply text-gray-300;
+    }
+  }
+}
