@@ -22,9 +22,7 @@ antigravity 에이전트는 본 문서를 기준으로 CSS 또는 SCSS 파일을
 모든 CSS 또는 SCSS 파일 상단에는 **반드시 아래 선언이 포함되어야 한다.**
 
 ```css
-@tailwind base;
-@tailwind components;
-@tailwind utilities;
+@import "tailwindcss";
 ```
 
 - 위 선언 이전에 어떠한 코드도 존재해서는 안 된다.
@@ -46,9 +44,7 @@ antigravity 에이전트는 본 문서를 기준으로 CSS 또는 SCSS 파일을
 ### 2.2 파일 기본 템플릿
 
 ```scss
-@tailwind base;
-@tailwind components;
-@tailwind utilities;
+@import "tailwindcss";
 ```
 
 ---
