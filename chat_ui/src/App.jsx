@@ -26,24 +26,52 @@ function App() {
     scrollToBottom();
   }, [messages]);
 
-  const handleSendMessage = (text) => {
+  const handleSendMessage = async (text) => {
     // 사용자 메시지 추가
     const newUserMsg = { id: Date.now(), role: 'user', content: text };
     setMessages(prev => [...prev, newUserMsg]);
     setIsGenerating(true);
 
-    // AI 응답 시뮬레이션 (Streaming 효과 흉내)
-    setTimeout(() => {
+    try {
+      // 백엔드 API 호출
+      const host = import.meta.env.VITE_SERVER_HOST || 'http://localhost';
+      const port = import.meta.env.VITE_SERVER_PORT || '8000';
+      const response = await fetch(`${host}:${port}/chat`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ message: text }),
+      });
+
+      if (!response.ok) {
+        throw new Error('Server responded with an error');
+      }
+
+      const data = await response.json();
+
       const newAiMsg = {
         id: Date.now() + 1,
         role: 'assistant',
-        content: `"${text}"에 대한 검색 결과입니다.\n\n요청하신 내용을 바탕으로 문서를 분석하고 있습니다. RAG 시스템은 질문의 '의미'를 파악하여 가장 관련성 높은 문서를 벡터 DB에서 찾아냅니다.\n\n주요 기능 예시:\n- 의미 기반 검색 (Semantic Search)\n- 메타데이터 필터링\n- 하이브리드 검색\n\n추가적인 질문이 있으시면 언제든지 말씀해주세요.`,
-        sources: ['기술명세서_v1.2.pdf', 'Q3_회의록.docx', '사내_위키.html'],
-        suggestions: ['이 답변의 출처를 자세히 보여줘', '관련된 다른 문서는 없나요?']
+        content: data.answer,
+        // 백엔드에서 아직 source를 주지 않으므로 빈 배열 처리 (추후 백엔드 업데이트 필요)
+        sources: [],
+        suggestions: []
       };
       setMessages(prev => [...prev, newAiMsg]);
+
+    } catch (error) {
+      console.error('Chat API Error:', error);
+      const errorMsg = {
+        id: Date.now() + 1,
+        role: 'assistant',
+        content: '죄송합니다. 서버 연결에 실패했거나 오류가 발생했습니다.\n잠시 후 다시 시도해주세요.',
+        isError: true
+      };
+      setMessages(prev => [...prev, errorMsg]);
+    } finally {
       setIsGenerating(false);
-    }, 1500);
+    }
   };
 
   const handleNewChat = () => {

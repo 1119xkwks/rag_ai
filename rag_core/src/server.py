@@ -13,6 +13,16 @@ app = FastAPI(
     version="1.0.0"
 )
 
+from fastapi.middleware.cors import CORSMiddleware
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"], # 개발 편의를 위해 모든 오리진 허용. 배포 시 보안 주의.
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 # RAG 매니저 인스턴스 (싱글톤처럼 사용)
 rag_manager = None
 
