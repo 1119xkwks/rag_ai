@@ -2,7 +2,7 @@ import React, { useState, useRef, useEffect } from 'react';
 import Sidebar from './components/Sidebar';
 import ChatInput from './components/ChatInput';
 import MessageBubble from './components/MessageBubble';
-import { Menu, Zap } from 'lucide-react';
+// import { Menu, Zap } from 'lucide-react'; // Removed lucide-react
 import './App.scss'
 
 function App() {
@@ -58,7 +58,7 @@ function App() {
   };
 
   return (
-    <div className="flex h-screen bg-gray-900 text-gray-100 font-sans overflow-hidden">
+    <div className="flex h-screen bg-white text-gray-900 font-sans overflow-hidden">
       {/* Sidebar */}
       <Sidebar
         isOpen={isSidebarOpen}
@@ -69,13 +69,13 @@ function App() {
       {/* Main Content */}
       <div className="flex-1 flex flex-col relative h-full w-full">
         {/* Top Navigation / Header */}
-        <header className="flex items-center justify-between px-4 py-3 border-b border-gray-800 bg-gray-900/95 backdrop-blur z-10">
+        <header className="flex items-center justify-between px-4 py-3 border-b border-gray-200 bg-white/95 backdrop-blur z-10">
           <div className="flex items-center gap-3">
             <button
               onClick={() => setIsSidebarOpen(!isSidebarOpen)}
-              className="p-2 text-gray-400 hover:text-white rounded-md md:hidden"
+              className="p-2 text-gray-600 hover:text-gray-900 rounded-md md:hidden"
             >
-              <Menu size={24} />
+              <i className="fas fa-bars text-xl"></i>
             </button>
             <div className="flex items-center gap-2">
               <span className="text-lg font-bold bg-gradient-to-r from-blue-400 to-teal-400 bg-clip-text text-transparent">
@@ -86,15 +86,15 @@ function App() {
           </div>
 
           <div className="flex items-center gap-3">
-            <button className="hidden md:flex items-center gap-2 px-3 py-1.5 text-sm bg-gray-800 hover:bg-gray-700 rounded-full border border-gray-700 transition-colors">
-              <Zap size={14} className="text-yellow-400" />
+            <button className="hidden md:flex items-center gap-2 px-3 py-1.5 text-sm bg-gray-100 hover:bg-gray-200 rounded-full border border-gray-300 transition-colors">
+              <i className="fas fa-bolt text-yellow-500 text-sm"></i>
               <span>GPT-4o</span>
             </button>
           </div>
         </header>
 
         {/* Chat Area */}
-        <main className="flex-1 overflow-y-auto scrollbar-thin scrollbar-thumb-gray-700 scrollbar-track-transparent bg-[#0f1117]">
+        <main className="flex-1 overflow-y-auto scrollbar-thin scrollbar-thumb-gray-300 scrollbar-track-transparent bg-gray-50">
           {messages.length === 0 ? (
             // 빈 화면일 때 (New Chat) - Logo Only
             <div className="h-full flex flex-col items-center justify-center text-gray-500 opacity-50">
@@ -112,7 +112,7 @@ function App() {
         </main>
 
         {/* Input Area */}
-        <div className="bg-gradient-to-t from-[#0f1117] via-[#0f1117] to-transparent pt-10 pb-6 px-4">
+        <div className="bg-gradient-to-t from-gray-50 via-gray-50 to-transparent pt-10 pb-6 px-4">
           <ChatInput onSendMessage={handleSendMessage} isGenerating={isGenerating} />
         </div>
       </div>
