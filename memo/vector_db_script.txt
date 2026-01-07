@@ -1,0 +1,45 @@
+
+/********************************************
+-- 1. pgvector 익스텐션 활성화 (이미 하셨다면 생략 가능)
+CREATE EXTENSION IF NOT EXISTS vector;
+
+-- 2. Gemini용 테이블 생성
+CREATE TABLE public.gemini_documents (
+  id      bigserial PRIMARY KEY,
+  content text NOT NULL,                -- 원본 텍스트 데이터
+  metadata jsonb,                       -- 출처나 제목 등 추가 정보 (선택사항)
+  embedding vector(768)                 -- Gemini text-embedding-004용 768차원
+);
+
+-- 3. 검색 속도 향상을 위한 인덱스 생성 (데이터가 많아질 때를 대비)
+-- HNSW 인덱스는 벡터 검색 시 매우 빠른 성능을 보장합니다.
+CREATE INDEX ON public.gemini_documents USING hnsw (embedding vector_cosine_ops);
+
+-- 4.검색을 위한 전용 함수 생성
+create or replace function match_documents (
+  query_embedding vector(768),
+  match_threshold float,
+  match_count int
+)
+returns table (
+  id bigint,
+  content text,
+  metadata jsonb,
+  similarity float
+)
+language plpgsql
+as $$
+begin
+  return query
+  select
+    gemini_documents.id,
+    gemini_documents.content,
+    gemini_documents.metadata,
+    1 - (gemini_documents.embedding <=> query_embedding) as similarity
+  from gemini_documents
+  where 1 - (gemini_documents.embedding <=> query_embedding) > match_threshold
+  order by similarity desc
+  limit match_count;
+end;
+$$;
+********************************************/

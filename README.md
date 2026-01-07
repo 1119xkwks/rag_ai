@@ -37,5 +37,14 @@ Google DeepMind의 Gemini 모델을 활용하여 질의응답 시스템을 구�
    pip install -r requirements.txt
    ```
 
+4. 환경 변수를 설정합니다. (`rag_core/.env` 파일 생성)
+   ```ini
+   PGHOST=ep-red-cherry-a1u9vh0q-pooler.ap-southeast-1.aws.neon.tech
+   PGDATABASE=neondb
+   PGUSER=neondb_owner
+   PGPASSWORD=npg_0Zts7hwQAiCV
+   PGSSLMODE=require
+   ```
+
 ## 사용 방법
 (기능 구현 후 상세 사용법을 추가할 예정입니다.)
