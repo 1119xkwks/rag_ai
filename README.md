@@ -400,13 +400,34 @@ Node 20+
 Docker
 ```
 
-Backend
+Backend (Windows / PowerShell 기준)
+
+1. 백엔드 디렉터리로 이동
 
 ```
 cd 03_PROG/BE/rag_ai
-pip install -r requirements.txt
-uvicorn main:app --reload
 ```
+
+2. 가상환경(선택 사항이지만 권장) 생성 및 활성화
+
+```
+python -m venv .venv
+.venv\Scripts\Activate.ps1
+```
+
+3. FastAPI + Uvicorn 등 의존성 설치
+
+```
+pip install -r requirements.txt
+```
+
+4. Uvicorn으로 개발 서버 실행 (포트 8000)
+
+```
+uvicorn rag_ai.main:app --reload --port 8000
+```
+
+→ 브라우저에서 `http://localhost:8000` 또는 `http://localhost:8000/docs` 접속
 
 Frontend
 
