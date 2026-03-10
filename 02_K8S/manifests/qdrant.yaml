@@ -1,0 +1,87 @@
+# How to re-create (kubectl):
+#   kubectl delete -f 02_K8S/manifests/qdrant.yaml --ignore-not-found
+#   kubectl apply  -f 02_K8S/manifests/qdrant.yaml
+#   kubectl get deploy qdrant
+#   kubectl get svc qdrant
+#
+# Rollout / 이미지 교체 재배포:
+#   # 최신 이미지로 강제 롤링 업데이트
+#   kubectl rollout restart deploy/qdrant
+#   kubectl rollout status deploy/qdrant
+#   # 필요 시 롤백
+#   kubectl rollout undo deploy/qdrant
+
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: qdrant-pvc
+  labels:
+    app: qdrant
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 10Gi
+  # storageClassName 생략 시 클러스터의 default StorageClass 사용
+  # 사용 가능한 목록: kubectl get storageclass
+  # 기본 지정: kubectl patch storageclass <이름> -p '{"metadata": {"annotations":{"storageclass.kubernetes.io/is-default-class":"true"}}}'
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: qdrant
+  labels:
+    app: qdrant
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: qdrant
+  template:
+    metadata:
+      labels:
+        app: qdrant
+    spec:
+      containers:
+        - name: qdrant
+          image: qdrant/qdrant:latest
+          ports:
+            - containerPort: 6333
+              name: http
+            - containerPort: 6334
+              name: grpc
+          env:
+            - name: QDRANT__SERVICE__GRPC_PORT
+              value: "6334"
+          volumeMounts:
+            - name: qdrant-storage
+              mountPath: /qdrant/storage
+      volumes:
+        - name: qdrant-storage
+          persistentVolumeClaim:
+            claimName: qdrant-pvc
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: qdrant
+  labels:
+    app: qdrant
+spec:
+  type: NodePort
+  selector:
+    app: qdrant
+  ports:
+    - name: http
+      port: 6333
+      targetPort: 6333
+      nodePort: 30633
+    - name: grpc
+      port: 6334
+      targetPort: 6334
+      nodePort: 30634
+

@@ -1,5 +1,6 @@
 from fastapi import FastAPI
 
+from rag_ai.api.documents import router as documents_router
 
 # FastAPI 애플리케이션 인스턴스를 생성합니다.
 # 이 객체가 전체 백엔드 서버의 진입점(엔트리 포인트)이 됩니다.
@@ -11,6 +12,9 @@ app = FastAPI(
     ),
     version="0.1.0",
 )
+
+# 문서 업로드·인입 API (POST /documents/ingest) 등록
+app.include_router(documents_router)
 
 
 @app.get("/health")
