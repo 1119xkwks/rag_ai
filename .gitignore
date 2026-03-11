@@ -1,6 +1,8 @@
 
-.env.keys
-/**/.env.keys
+.env
+/**/.env
+.env.local
+/**/.env.local
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
