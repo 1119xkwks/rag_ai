@@ -84,6 +84,7 @@ def search_similar(
     collection_name: str,
     query_vector: List[float],
     top_k: int = 5,
+    source: str | None = None,
 ) -> List[dict[str, Any]]:
     """
     쿼리 벡터와 유사한 상위 top_k개 포인트를 검색합니다.
@@ -94,14 +95,30 @@ def search_similar(
         collection_name: 검색할 컬렉션
         query_vector: 질문(또는 검색어)의 임베딩 벡터
         top_k: 가져올 결과 개수
+        source: (선택) payload의 source 값으로 필터링하고 싶을 때 사용
 
     반환:
         각 결과의 payload와 score를 담은 딕셔너리 리스트 (payload에 text 등이 있음)
     """
+    # source를 지정하면, 해당 source로 저장된 청크만 검색하도록 필터를 걸어줍니다.
+    # 예: PDF 업로드 시 payload에 {"source": "my.pdf"}로 저장했으니,
+    #     질문할 때 source="my.pdf"로 주면 그 문서 범위에서만 검색할 수 있습니다.
+    query_filter = None
+    if source:
+        query_filter = models.Filter(
+            must=[
+                models.FieldCondition(
+                    key="source",
+                    match=models.MatchValue(value=source),
+                )
+            ]
+        )
+
     results = client.search(
         collection_name=collection_name,
         query_vector=query_vector,
         limit=top_k,
+        query_filter=query_filter,
     )
     return [
         {"id": hit.id, "score": hit.score, "payload": hit.payload or {}}

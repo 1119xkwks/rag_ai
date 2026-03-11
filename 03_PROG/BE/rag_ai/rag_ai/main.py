@@ -1,5 +1,6 @@
 from fastapi import FastAPI
 
+from rag_ai.api.chat import router as chat_router
 from rag_ai.api.documents import router as documents_router
 
 # FastAPI 애플리케이션 인스턴스를 생성합니다.
@@ -15,6 +16,9 @@ app = FastAPI(
 
 # 문서 업로드·인입 API (POST /documents/ingest) 등록
 app.include_router(documents_router)
+
+# 채팅(RAG 질의) API (POST /chat/ask) 등록
+app.include_router(chat_router)
 
 
 @app.get("/health")
