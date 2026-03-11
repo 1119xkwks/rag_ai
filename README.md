@@ -424,9 +424,6 @@ pip install -r requirements.txt
 4. Uvicorn으로 개발 서버 실행 (포트 8000)
 
 ```
-cd 03_PROG\BE\rag_ai
-python -m venv venv
-venv\Scripts\activate
 uvicorn rag_ai.main:app --reload --port 8000
 ```
 
