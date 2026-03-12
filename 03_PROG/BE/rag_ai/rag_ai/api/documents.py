@@ -1,11 +1,14 @@
 # documents.py
 # 문서 업로드 및 PDF 인입 API 엔드포인트를 정의합니다.
 
+import logging
+
 from fastapi import APIRouter, File, HTTPException, Query, UploadFile
 
 from rag_ai.services.ingestion_pipeline import run_ingestion
 
 router = APIRouter(prefix="/documents", tags=["documents"])
+logger = logging.getLogger("rag_ai.api.documents")
 
 
 @router.post("/ingest")
@@ -35,9 +38,21 @@ async def ingest_pdf(
 
     # 출처 이름이 비어 있으면 업로드된 파일명 사용
     source = source_name.strip() or (file.filename or "upload")
+    logger.debug(
+        "[DOC_INGEST] filename=%s source=%s size_bytes=%s",
+        file.filename,
+        source,
+        len(pdf_bytes),
+    )
 
     result = run_ingestion(pdf_bytes, source_name=source)
     if not result.get("ok"):
         raise HTTPException(status_code=500, detail=result.get("error", "인입 실패"))
 
+    logger.debug(
+        "[DOC_INGEST_DONE] source=%s chunks_created=%s points_upserted=%s",
+        source,
+        result.get("chunks_created", 0),
+        result.get("points_upserted", 0),
+    )
     return result

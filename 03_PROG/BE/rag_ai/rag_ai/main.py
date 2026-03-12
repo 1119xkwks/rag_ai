@@ -1,7 +1,20 @@
-from fastapi import FastAPI
+import logging
+import time
+import uuid
+
+from fastapi import FastAPI, Request
+from fastapi.responses import Response
 
 from rag_ai.api.chat import router as chat_router
 from rag_ai.api.documents import router as documents_router
+from rag_ai.config import settings
+
+# 전체 애플리케이션 로그 레벨을 환경 변수(settings.log_level)에 맞춰 설정합니다.
+logging.basicConfig(
+    level=getattr(logging, settings.log_level.upper(), logging.INFO),
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+)
+logger = logging.getLogger("rag_ai.app")
 
 # FastAPI 애플리케이션 인스턴스를 생성합니다.
 # 이 객체가 전체 백엔드 서버의 진입점(엔트리 포인트)이 됩니다.
@@ -19,6 +32,70 @@ app.include_router(documents_router)
 
 # 채팅(RAG 질의) API (POST /chat/ask) 등록
 app.include_router(chat_router)
+
+
+@app.middleware("http")
+async def request_logging_middleware(request: Request, call_next) -> Response:
+    """
+    모든 HTTP 요청에 대해 시작/종료 로그를 남기는 미들웨어.
+
+    로그 목적:
+    - 어떤 endpoint가 호출됐는지 확인
+    - 처리 시간(ms) 추적
+    - 오래 걸린 요청(SLOW)을 빠르게 탐지
+    """
+    request_id = str(uuid.uuid4())[:8]
+    start = time.perf_counter()
+
+    # 요청 시작 로그: method, path, query, client ip를 함께 찍어 디버깅에 활용
+    logger.debug(
+        "[REQ_START] request_id=%s method=%s path=%s query=%s client=%s",
+        request_id,
+        request.method,
+        request.url.path,
+        request.url.query,
+        request.client.host if request.client else "-",
+    )
+
+    try:
+        response = await call_next(request)
+    except Exception:
+        elapsed_ms = (time.perf_counter() - start) * 1000
+        logger.exception(
+            "[REQ_ERROR] request_id=%s method=%s path=%s elapsed_ms=%.1f",
+            request_id,
+            request.method,
+            request.url.path,
+            elapsed_ms,
+        )
+        raise
+
+    elapsed_ms = (time.perf_counter() - start) * 1000
+    response.headers["X-Request-Id"] = request_id
+
+    # 종료 로그: status code + elapsed time
+    logger.debug(
+        "[REQ_END] request_id=%s method=%s path=%s status=%s elapsed_ms=%.1f",
+        request_id,
+        request.method,
+        request.url.path,
+        response.status_code,
+        elapsed_ms,
+    )
+
+    # 느린 요청은 WARNING으로도 남겨 운영 중 병목 탐색을 쉽게 합니다.
+    if elapsed_ms >= settings.slow_request_ms:
+        logger.warning(
+            "[REQ_SLOW] request_id=%s method=%s path=%s status=%s elapsed_ms=%.1f threshold_ms=%s",
+            request_id,
+            request.method,
+            request.url.path,
+            response.status_code,
+            elapsed_ms,
+            settings.slow_request_ms,
+        )
+
+    return response
 
 
 @app.get("/health")

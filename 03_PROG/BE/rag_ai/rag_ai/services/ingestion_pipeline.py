@@ -48,7 +48,9 @@ def run_ingestion(
         return {"ok": False, "error": "생성된 청크가 없습니다.", "chunks_created": 0}
 
     # 3단계: 각 청크를 임베딩 벡터로 변환
-    vectors = embed_texts(chunks)
+    # 문서 임베딩도 설정된 embedding_provider를 따라야,
+    # 질문 임베딩과 동일한 벡터 공간에서 검색이 정확해집니다.
+    vectors = embed_texts(chunks, provider=settings.embedding_provider)
 
     # 4단계: Qdrant 연결 후 컬렉션 존재 확인(없으면 생성)
     client = get_qdrant_client()

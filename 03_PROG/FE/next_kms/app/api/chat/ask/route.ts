@@ -8,6 +8,9 @@ type ChatAskRequest = {
   question: string;
   top_k?: number;
   source?: string;
+  llm_provider?: string;
+  llm_model?: string;
+  embedding_provider?: string;
 };
 
 function getBackendBaseUrl(): string {
@@ -39,6 +42,9 @@ export async function POST(req: Request) {
     question,
     top_k: body.top_k ?? 5,
     source: (body.source || "").trim(),
+    llm_provider: (body.llm_provider || "").trim(),
+    llm_model: (body.llm_model || "").trim(),
+    embedding_provider: (body.embedding_provider || "").trim(),
   };
 
   // 4) FastAPI 백엔드로 요청을 전달합니다.

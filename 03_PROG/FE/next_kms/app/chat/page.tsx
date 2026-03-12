@@ -1,6 +1,6 @@
 "use client";
 
-import { useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 
 type ChatRole = "user" | "assistant";
 
@@ -16,10 +16,22 @@ type RagContextHit = {
   payload: Record<string, unknown>;
 };
 
+type ChatLlmProvider = "openai" | "vllm" | "gemini";
+type ChatEmbeddingProvider = "openai" | "vllm" | "gemini";
+
 type ChatAskResponse = {
   ok: boolean;
   answer?: string;
   contexts?: RagContextHit[];
+  used_llm_provider?: string;
+  used_llm_model?: string;
+  error?: string;
+};
+
+type ChatModelsResponse = {
+  ok: boolean;
+  provider: string;
+  models: string[];
   error?: string;
 };
 
@@ -32,6 +44,13 @@ export default function ChatPage() {
   const [question, setQuestion] = useState("");
   const [source, setSource] = useState("");
   const [topK, setTopK] = useState(5);
+  const [llmProvider, setLlmProvider] = useState<ChatLlmProvider>("vllm");
+  const [llmModel, setLlmModel] = useState("");
+  const [availableModels, setAvailableModels] = useState<string[]>([]);
+  const [modelsLoading, setModelsLoading] = useState(false);
+  const [modelsError, setModelsError] = useState("");
+  const [embeddingProvider, setEmbeddingProvider] =
+    useState<ChatEmbeddingProvider>("gemini");
   const [isLoading, setIsLoading] = useState(false);
 
   const [messages, setMessages] = useState<ChatMessage[]>([
@@ -49,6 +68,51 @@ export default function ChatPage() {
   const canSubmit = useMemo(() => {
     return question.trim().length > 0 && !isLoading;
   }, [question, isLoading]);
+
+  // LLM provider가 바뀌면 해당 provider의 모델 목록을 백엔드에서 조회합니다.
+  useEffect(() => {
+    let cancelled = false;
+
+    async function loadModels() {
+      setModelsLoading(true);
+      setModelsError("");
+      try {
+        const res = await fetch(
+          `/api/chat/models?llm_provider=${encodeURIComponent(llmProvider)}`,
+        );
+        const data = (await res.json()) as ChatModelsResponse;
+        if (!data.ok) {
+          if (!cancelled) {
+            setAvailableModels([]);
+            setLlmModel("");
+            setModelsError(data.error || "모델 목록 조회 실패");
+          }
+          return;
+        }
+
+        const models = Array.isArray(data.models) ? data.models : [];
+        if (!cancelled) {
+          setAvailableModels(models);
+          setLlmModel(models[0] || "");
+        }
+      } catch (e) {
+        if (!cancelled) {
+          setAvailableModels([]);
+          setLlmModel("");
+          setModelsError(`모델 목록 네트워크 오류: ${String(e)}`);
+        }
+      } finally {
+        if (!cancelled) {
+          setModelsLoading(false);
+        }
+      }
+    }
+
+    void loadModels();
+    return () => {
+      cancelled = true;
+    };
+  }, [llmProvider]);
 
   async function onSubmit() {
     if (!canSubmit) return;
@@ -75,6 +139,9 @@ export default function ChatPage() {
           question: q,
           top_k: topK,
           source: source.trim(),
+          llm_provider: llmProvider,
+          llm_model: llmModel,
+          embedding_provider: embeddingProvider,
         }),
       });
 
@@ -173,7 +240,7 @@ export default function ChatPage() {
 
             {/* 입력 영역 */}
             <div className="border-t border-zinc-200 p-4 dark:border-zinc-800">
-              <div className="grid grid-cols-1 gap-3 md:grid-cols-3">
+              <div className="grid grid-cols-1 gap-3 md:grid-cols-5">
                 <label className="flex flex-col gap-1">
                   <span className="text-xs font-medium text-zinc-600 dark:text-zinc-400">
                     source(선택)
@@ -200,7 +267,61 @@ export default function ChatPage() {
                   />
                 </label>
 
-                <div className="hidden md:block" />
+                <label className="flex flex-col gap-1">
+                  <span className="text-xs font-medium text-zinc-600 dark:text-zinc-400">
+                    LLM provider
+                  </span>
+                  <select
+                    className="h-10 rounded-xl border border-zinc-200 bg-white px-3 text-sm outline-none focus:border-zinc-400 dark:border-zinc-800 dark:bg-zinc-950 dark:focus:border-zinc-600"
+                    value={llmProvider}
+                    onChange={(e) => setLlmProvider(e.target.value as ChatLlmProvider)}
+                  >
+                    <option value="vllm">vLLM (내부 서버)</option>
+                    <option value="openai">OpenAI</option>
+                    <option value="gemini">Gemini</option>
+                  </select>
+                </label>
+
+                <label className="flex flex-col gap-1">
+                  <span className="text-xs font-medium text-zinc-600 dark:text-zinc-400">
+                    LLM model
+                  </span>
+                  <select
+                    className="h-10 rounded-xl border border-zinc-200 bg-white px-3 text-sm outline-none focus:border-zinc-400 disabled:cursor-not-allowed disabled:bg-zinc-100 dark:border-zinc-800 dark:bg-zinc-950 dark:focus:border-zinc-600 dark:disabled:bg-zinc-900"
+                    value={llmModel}
+                    onChange={(e) => setLlmModel(e.target.value)}
+                    disabled={modelsLoading || availableModels.length === 0}
+                  >
+                    {availableModels.length === 0 ? (
+                      <option value="">
+                        {modelsLoading ? "모델 불러오는 중..." : "모델 없음"}
+                      </option>
+                    ) : (
+                      availableModels.map((m) => (
+                        <option key={m} value={m}>
+                          {m}
+                        </option>
+                      ))
+                    )}
+                  </select>
+                </label>
+
+                <label className="flex flex-col gap-1">
+                  <span className="text-xs font-medium text-zinc-600 dark:text-zinc-400">
+                    Embedding provider
+                  </span>
+                  <select
+                    className="h-10 rounded-xl border border-zinc-200 bg-white px-3 text-sm outline-none focus:border-zinc-400 dark:border-zinc-800 dark:bg-zinc-950 dark:focus:border-zinc-600"
+                    value={embeddingProvider}
+                    onChange={(e) =>
+                      setEmbeddingProvider(e.target.value as ChatEmbeddingProvider)
+                    }
+                  >
+                    <option value="vllm">vLLM (내부 서버)</option>
+                    <option value="openai">OpenAI</option>
+                    <option value="gemini">Gemini</option>
+                  </select>
+                </label>
               </div>
 
               <div className="mt-3 flex gap-3">
@@ -227,8 +348,13 @@ export default function ChatPage() {
 
               <p className="mt-3 text-xs text-zinc-500">
                 팁: PDF 인입 시 source로 파일명이 저장됩니다. 같은 값을 source에 넣으면 그
-                문서 범위에서만 검색합니다.
+                문서 범위에서만 검색합니다. LLM/Embedding provider는 요청마다 각각 선택할 수 있습니다.
               </p>
+              {modelsError ? (
+                <p className="mt-2 text-xs text-red-600 dark:text-red-400">
+                  모델 목록 오류: {modelsError}
+                </p>
+              ) : null}
             </div>
           </div>
         </section>
