@@ -47,3 +47,39 @@ def chunk_text(
             break
 
     return chunks
+
+
+def chunk_markdown_by_h3(markdown_text: str) -> List[str]:
+    """
+    '### ' 헤더를 기준으로 마크다운 텍스트를 청크로 분리합니다.
+
+    동작 방식:
+    - 각 '### 제목' + 그 아래 본문을 하나의 청크로 묶음
+    - 헤더가 전혀 없으면 빈 리스트 반환 (호출 측에서 fallback 가능)
+    """
+    if not markdown_text or not markdown_text.strip():
+        return []
+
+    lines = markdown_text.splitlines()
+    chunks: List[str] = []
+    current: List[str] = []
+
+    for line in lines:
+        if line.strip().startswith("### "):
+            # 새 헤더를 만나면 기존 블록을 청크로 확정
+            if current:
+                block = "\n".join(current).strip()
+                if block:
+                    chunks.append(block)
+                current = []
+        current.append(line)
+
+    # 마지막 블록 처리
+    if current:
+        block = "\n".join(current).strip()
+        if block:
+            chunks.append(block)
+
+    # '### ' 헤더가 아예 없는 경우를 감지해 빈 리스트 반환
+    has_h3 = any(c.lstrip().startswith("### ") for c in chunks)
+    return chunks if has_h3 else []

@@ -35,6 +35,15 @@ type ChatModelsResponse = {
   error?: string;
 };
 
+type DocumentIngestResponse = {
+  ok: boolean;
+  source?: string;
+  chunks_created?: number;
+  points_upserted?: number;
+  llm_cleanup_used?: boolean;
+  error?: string;
+};
+
 function safeString(value: unknown): string {
   if (typeof value === "string") return value;
   return "";
@@ -52,6 +61,18 @@ export default function ChatPage() {
   const [embeddingProvider, setEmbeddingProvider] =
     useState<ChatEmbeddingProvider>("gemini");
   const [isLoading, setIsLoading] = useState(false);
+  const [pdfFile, setPdfFile] = useState<File | null>(null);
+  const [ingestSourceName, setIngestSourceName] = useState("");
+  const [ingestUseCleanup, setIngestUseCleanup] = useState(true);
+  const [ingestCleanupProvider, setIngestCleanupProvider] =
+    useState<ChatLlmProvider>("gemini");
+  const [ingestCleanupModel, setIngestCleanupModel] = useState("");
+  const [ingestCleanupModels, setIngestCleanupModels] = useState<string[]>([]);
+  const [ingestCleanupModelsLoading, setIngestCleanupModelsLoading] =
+    useState(false);
+  const [ingestCleanupModelsError, setIngestCleanupModelsError] = useState("");
+  const [ingestLoading, setIngestLoading] = useState(false);
+  const [ingestMessage, setIngestMessage] = useState("");
 
   const [messages, setMessages] = useState<ChatMessage[]>([
     {
@@ -113,6 +134,99 @@ export default function ChatPage() {
       cancelled = true;
     };
   }, [llmProvider]);
+
+  // PDF 인입용 cleanup provider가 바뀌면 해당 provider의 모델 목록을 조회합니다.
+  useEffect(() => {
+    let cancelled = false;
+
+    async function loadCleanupModels() {
+      if (!ingestUseCleanup) {
+        setIngestCleanupModels([]);
+        setIngestCleanupModel("");
+        setIngestCleanupModelsError("");
+        setIngestCleanupModelsLoading(false);
+        return;
+      }
+
+      setIngestCleanupModelsLoading(true);
+      setIngestCleanupModelsError("");
+      try {
+        const res = await fetch(
+          `/api/chat/models?llm_provider=${encodeURIComponent(ingestCleanupProvider)}`,
+        );
+        const data = (await res.json()) as ChatModelsResponse;
+        if (!data.ok) {
+          if (!cancelled) {
+            setIngestCleanupModels([]);
+            setIngestCleanupModel("");
+            setIngestCleanupModelsError(data.error || "정제 모델 목록 조회 실패");
+          }
+          return;
+        }
+
+        const models = Array.isArray(data.models) ? data.models : [];
+        if (!cancelled) {
+          setIngestCleanupModels(models);
+          setIngestCleanupModel(models[0] || "");
+        }
+      } catch (e) {
+        if (!cancelled) {
+          setIngestCleanupModels([]);
+          setIngestCleanupModel("");
+          setIngestCleanupModelsError(`정제 모델 목록 네트워크 오류: ${String(e)}`);
+        }
+      } finally {
+        if (!cancelled) {
+          setIngestCleanupModelsLoading(false);
+        }
+      }
+    }
+
+    void loadCleanupModels();
+    return () => {
+      cancelled = true;
+    };
+  }, [ingestCleanupProvider, ingestUseCleanup]);
+
+  async function onIngestPdf() {
+    if (!pdfFile || ingestLoading) return;
+
+    setIngestLoading(true);
+    setIngestMessage("");
+
+    try {
+      const form = new FormData();
+      form.set("file", pdfFile);
+      form.set("source_name", ingestSourceName.trim());
+      form.set("use_llm_cleanup", String(ingestUseCleanup));
+      form.set("cleanup_provider", ingestCleanupProvider);
+      form.set("cleanup_model", ingestCleanupModel.trim());
+
+      const res = await fetch("/api/documents/ingest", {
+        method: "POST",
+        body: form,
+      });
+      const data = (await res.json()) as DocumentIngestResponse;
+
+      if (!data.ok) {
+        setIngestMessage(`인입 실패: ${data.error || "알 수 없는 오류"}`);
+        return;
+      }
+
+      // 인입 성공 시 source를 자동 반영해 바로 해당 문서 범위로 질문할 수 있게 함
+      if (data.source) {
+        setSource(data.source);
+      }
+
+      setIngestMessage(
+        `인입 완료: source=${data.source || "-"}, chunks=${data.chunks_created || 0}, points=${data.points_upserted || 0}`,
+      );
+    } catch (e) {
+      setIngestMessage(`인입 네트워크 오류: ${String(e)}`);
+    } finally {
+      setIngestLoading(false);
+    }
+  }
 
   async function onSubmit() {
     if (!canSubmit) return;
@@ -203,6 +317,117 @@ export default function ChatPage() {
               </p>
             </div>
           </header>
+
+          {/* PDF 인입 UI */}
+          <div className="mb-4 rounded-2xl border border-zinc-200 bg-white p-4 dark:border-zinc-800 dark:bg-zinc-950">
+            <h2 className="text-sm font-semibold">PDF 인입</h2>
+            <p className="mt-1 text-xs text-zinc-600 dark:text-zinc-400">
+              파일 업로드 후 벡터 DB에 저장합니다. 정제 옵션을 켜면 청킹 전에 LLM 정제를 수행합니다.
+            </p>
+
+            <div className="mt-3 grid grid-cols-1 gap-3 md:grid-cols-2">
+              <label className="flex flex-col gap-1">
+                <span className="text-xs font-medium text-zinc-600 dark:text-zinc-400">
+                  PDF 파일
+                </span>
+                <input
+                  type="file"
+                  accept=".pdf,application/pdf"
+                  className="h-10 rounded-xl border border-zinc-200 bg-white px-3 text-sm file:mr-2 file:rounded-md file:border-0 file:bg-zinc-100 file:px-2 file:py-1 file:text-xs dark:border-zinc-800 dark:bg-zinc-950 dark:file:bg-zinc-800"
+                  onChange={(e) => setPdfFile(e.target.files?.[0] || null)}
+                />
+              </label>
+
+              <label className="flex flex-col gap-1">
+                <span className="text-xs font-medium text-zinc-600 dark:text-zinc-400">
+                  source_name(선택)
+                </span>
+                <input
+                  className="h-10 rounded-xl border border-zinc-200 bg-white px-3 text-sm outline-none focus:border-zinc-400 dark:border-zinc-800 dark:bg-zinc-950 dark:focus:border-zinc-600"
+                  value={ingestSourceName}
+                  onChange={(e) => setIngestSourceName(e.target.value)}
+                  placeholder="비우면 파일명 사용"
+                />
+              </label>
+
+              <label className="flex items-center gap-2 text-sm">
+                <input
+                  type="checkbox"
+                  checked={ingestUseCleanup}
+                  onChange={(e) => setIngestUseCleanup(e.target.checked)}
+                />
+                <span>청킹 전 LLM 정제 사용</span>
+              </label>
+
+              <label className="flex flex-col gap-1">
+                <span className="text-xs font-medium text-zinc-600 dark:text-zinc-400">
+                  cleanup provider
+                </span>
+                <select
+                  className="h-10 rounded-xl border border-zinc-200 bg-white px-3 text-sm outline-none focus:border-zinc-400 dark:border-zinc-800 dark:bg-zinc-950 dark:focus:border-zinc-600"
+                  value={ingestCleanupProvider}
+                  onChange={(e) =>
+                    setIngestCleanupProvider(e.target.value as ChatLlmProvider)
+                  }
+                  disabled={!ingestUseCleanup}
+                >
+                  <option value="gemini">Gemini</option>
+                  <option value="vllm">vLLM (내부 서버)</option>
+                  <option value="openai">OpenAI</option>
+                </select>
+              </label>
+            </div>
+
+            <div className="mt-3 flex gap-3">
+              <select
+                className="h-10 w-full rounded-xl border border-zinc-200 bg-white px-3 text-sm outline-none focus:border-zinc-400 disabled:cursor-not-allowed disabled:bg-zinc-100 dark:border-zinc-800 dark:bg-zinc-950 dark:focus:border-zinc-600 dark:disabled:bg-zinc-900"
+                value={ingestCleanupModel}
+                onChange={(e) => setIngestCleanupModel(e.target.value)}
+                disabled={
+                  !ingestUseCleanup ||
+                  ingestCleanupModelsLoading ||
+                  ingestCleanupModels.length === 0
+                }
+              >
+                {ingestCleanupModels.length === 0 ? (
+                  <option value="">
+                    {ingestCleanupModelsLoading
+                      ? "정제 모델 불러오는 중..."
+                      : "정제 모델 없음"}
+                  </option>
+                ) : (
+                  ingestCleanupModels.map((m) => (
+                    <option key={m} value={m}>
+                      {m}
+                    </option>
+                  ))
+                )}
+              </select>
+              <button
+                className={[
+                  "h-10 shrink-0 rounded-xl px-4 text-sm font-medium",
+                  pdfFile && !ingestLoading
+                    ? "bg-zinc-900 text-white hover:bg-zinc-800 dark:bg-zinc-100 dark:text-zinc-900 dark:hover:bg-white"
+                    : "cursor-not-allowed bg-zinc-200 text-zinc-500 dark:bg-zinc-900 dark:text-zinc-500",
+                ].join(" ")}
+                onClick={() => void onIngestPdf()}
+                disabled={!pdfFile || ingestLoading}
+              >
+                {ingestLoading ? "인입 중..." : "PDF 인입"}
+              </button>
+            </div>
+
+            {ingestMessage ? (
+              <p className="mt-2 text-xs text-zinc-600 dark:text-zinc-400">
+                {ingestMessage}
+              </p>
+            ) : null}
+            {ingestCleanupModelsError ? (
+              <p className="mt-2 text-xs text-red-600 dark:text-red-400">
+                정제 모델 목록 오류: {ingestCleanupModelsError}
+              </p>
+            ) : null}
+          </div>
 
           <div className="rounded-2xl border border-zinc-200 bg-white dark:border-zinc-800 dark:bg-zinc-950">
             {/* 메시지 리스트 */}

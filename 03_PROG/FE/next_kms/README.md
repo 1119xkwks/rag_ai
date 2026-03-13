@@ -15,6 +15,7 @@ BACKEND_BASE_URL=http://127.0.0.1:8000
 개발 서버 실행:
 
 ```bash
+cd 03_PROG\FE\next_kms
 pnpm dev
 ```
 

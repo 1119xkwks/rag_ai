@@ -70,6 +70,11 @@ class Settings(BaseSettings):
     # 이 시간(ms)보다 오래 걸린 요청은 별도로 WARNING 로그를 남깁니다.
     slow_request_ms: int = 3000
 
+    # ----- Ingestion LLM 정제 기본값 -----
+    # /documents/ingest에서 cleanup_provider를 비웠을 때 사용할 기본 provider
+    # (비어 있으면 llm_provider를 그대로 사용)
+    cleanup_provider: str = ""
+
     # ----- Ingestion 기본값 -----
     # 청크 하나당 목표 글자 수 (이 단위로 잘라서 벡터화함)
     chunk_size: int = 2000
