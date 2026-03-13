@@ -23,6 +23,7 @@ logger = logging.getLogger("rag_ai.services.ingestion")
 def run_ingestion(
     pdf_bytes: bytes,
     source_name: str = "",
+    extract_method: str | None = None,
     chunk_size: int | None = None,
     chunk_overlap: int | None = None,
     use_llm_cleanup: bool = False,
@@ -35,6 +36,7 @@ def run_ingestion(
     인자:
         pdf_bytes: PDF 파일의 바이트 내용 (예: 업로드된 파일)
         source_name: 문서 출처 표시용 이름 (payload에 저장되어 나중에 필터링 가능)
+        extract_method: PDF 텍스트 추출 방식 (pypdf | vision_qwen), None이면 설정값 사용
         chunk_size: 청크 크기. None이면 설정값 사용
         chunk_overlap: 청크 겹침. None이면 설정값 사용
         use_llm_cleanup: True면 청킹 전에 LLM 정제를 먼저 수행
@@ -51,9 +53,10 @@ def run_ingestion(
 
     total_start = time.perf_counter()
     logger.debug(
-        "[INGEST_START] source=%s bytes=%s use_llm_cleanup=%s cleanup_provider=%s cleanup_model=%s embedding_provider=%s",
+        "[INGEST_START] source=%s bytes=%s extract_method=%s use_llm_cleanup=%s cleanup_provider=%s cleanup_model=%s embedding_provider=%s",
         source,
         len(pdf_bytes),
+        extract_method or settings.pdf_extract_method,
         use_llm_cleanup,
         cleanup_provider or settings.cleanup_provider or settings.llm_provider,
         cleanup_model or "",
@@ -62,11 +65,17 @@ def run_ingestion(
 
     # 1단계: PDF에서 텍스트 추출
     t_extract = time.perf_counter()
-    logger.debug("[INGEST_STEP_START] step=extract_text source=%s", source)
-    full_text = load_text_from_pdf_bytes(pdf_bytes)
+    chosen_extract_method = (extract_method or settings.pdf_extract_method).strip().lower()
     logger.debug(
-        "[INGEST_STEP_DONE] step=extract_text source=%s text_len=%s elapsed_ms=%.1f",
+        "[INGEST_STEP_START] step=extract_text source=%s method=%s",
         source,
+        chosen_extract_method,
+    )
+    full_text = load_text_from_pdf_bytes(pdf_bytes, extract_method=chosen_extract_method)
+    logger.debug(
+        "[INGEST_STEP_DONE] step=extract_text source=%s method=%s text_len=%s elapsed_ms=%.1f",
+        source,
+        chosen_extract_method,
         len(full_text),
         (time.perf_counter() - t_extract) * 1000,
     )

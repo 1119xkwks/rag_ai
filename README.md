@@ -429,6 +429,20 @@ uvicorn rag_ai.main:app --reload --port 8000
 
 → 브라우저에서 `http://localhost:8000` 또는 `http://localhost:8000/docs` 접속
 
+### PDF 텍스트 추출 방식 (vision_qwen)과 로그 설명
+
+Ingestion에서 **텍스트 추출 방식**을 `vision_qwen`으로 선택하면, PDF를 **이미지로 렌더링한 뒤 Qwen-VL(Vision-Language 모델)**로 페이지별 OCR을 수행합니다. 그림·표·그래프가 있는 문서에 유리하지만 **처리 시간이 길어집니다**.
+
+| 단계 | 로그 예시 | 설명 |
+|------|-----------|------|
+| 1) 모델 다운로드/로딩 | `[vision_qwen] Hugging Face에서 Qwen-VL 모델 다운로드/로딩 중 (최초 1회...)` | Hugging Face에서 `Qwen/Qwen2.5-VL-3B-Instruct` 등 모델 가중치·설정 파일(`generation_config.json` 등)을 받습니다. **최초 1회만** 발생하며 수 분~수십 분 걸릴 수 있습니다. |
+| 2) 모델 로딩 완료 | `[vision_qwen] 모델 로딩 완료. model=...` | 모델이 메모리(GPU/CPU)에 올라왔습니다. |
+| 3) PDF → 이미지 | `[vision_qwen] PDF → 이미지 변환 완료. 총 N페이지.` | pypdfium2로 PDF 각 페이지를 이미지로 렌더링했습니다. |
+| 4) 페이지별 OCR | `[vision_qwen] PDF 페이지 1/9 Vision OCR 수행 중 (...)` | 해당 페이지 이미지를 Qwen-VL에 넣어 텍스트를 추출하는 중입니다. **페이지당 수 분** 걸릴 수 있습니다. |
+| 5) 페이지 완료 | `[vision_qwen] PDF 페이지 1/9 완료. 추출 글자 수=...` | 해당 페이지 OCR이 끝났습니다. 다음 페이지로 진행합니다. |
+
+FE에서 `/api/documents/extract-text` 호출 시 **타임아웃은 1시간**으로 설정되어 있으므로, 백엔드가 끝날 때까지 기다리면 됩니다. 500이 나오는 경우 대부분 **FE/프록시 타임아웃**이었으므로, 위 설정으로 1시간까지 대기하도록 변경했습니다.
+
 Frontend
 
 ```

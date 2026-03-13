@@ -76,6 +76,20 @@ class Settings(BaseSettings):
     cleanup_provider: str = ""
 
     # ----- Ingestion 기본값 -----
+    # PDF 텍스트 추출 기본 방식:
+    # - pypdf: 텍스트 레이어 기반(빠름, 스캔 PDF 취약)
+    # - vision_qwen: PDF를 이미지로 렌더 후 Qwen-VL로 인식(느리지만 복합 문서 대응)
+    pdf_extract_method: str = "pypdf"
+    # vision_qwen에서 사용할 로컬/허브 모델 ID
+    qwen_vl_model_id: str = "Qwen/Qwen2.5-VL-3B-Instruct"
+    # vision_qwen 처리 시 최대 페이지 수 (0 이하면 전체 페이지)
+    qwen_vl_max_pages: int = 20
+    # vision_qwen PDF 렌더 DPI
+    qwen_vl_dpi: int = 160
+    # vision_qwen 페이지별 최대 생성 토큰
+    qwen_vl_max_new_tokens: int = 1024
+
+    # ----- Ingestion 기본값 -----
     # 청크 하나당 목표 글자 수 (이 단위로 잘라서 벡터화함)
     chunk_size: int = 2000
     # 청크 간 겹치는 글자 수 (문맥 연속성 유지용)
