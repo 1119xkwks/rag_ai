@@ -5,9 +5,13 @@
 from typing import Any
 
 import httpx
+import logging
+import time
 from openai import OpenAI
 
 from rag_ai.config import settings
+
+logger = logging.getLogger("rag_ai.services.text_cleanup")
 
 
 def _default_model_for_provider(provider: str) -> str:
@@ -70,6 +74,13 @@ def preprocess_text_with_llm(
         url = (
             f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent"
         )
+        t = time.perf_counter()
+        logger.debug(
+            "[CLEANUP_LLM_START] provider=gemini model=%s full_url=%s raw_text_len=%s",
+            model_name,
+            url,
+            len(raw_text),
+        )
         timeout = httpx.Timeout(
             connect=min(settings.gemini_timeout_sec, 30.0),
             read=settings.gemini_timeout_sec,
@@ -97,9 +108,22 @@ def preprocess_text_with_llm(
         text = "".join([str(p.get("text", "")) for p in parts]).strip()
         if not text:
             raise ValueError("Gemini 정제 결과 텍스트가 비어 있습니다.")
+        logger.debug(
+            "[CLEANUP_LLM_DONE] provider=gemini model=%s cleaned_len=%s elapsed_ms=%.1f",
+            model_name,
+            len(text),
+            (time.perf_counter() - t) * 1000,
+        )
         return text
 
     if p == "vllm":
+        t = time.perf_counter()
+        logger.debug(
+            "[CLEANUP_LLM_START] provider=vllm model=%s full_url=%s raw_text_len=%s",
+            model_name,
+            f"{settings.vllm_api_url.rstrip('/')}/chat/completions",
+            len(raw_text),
+        )
         client = OpenAI(
             base_url=settings.vllm_api_url,
             api_key=settings.vllm_api_key or "EMPTY",
@@ -108,6 +132,13 @@ def preprocess_text_with_llm(
     else:
         if not settings.openai_api_key:
             raise ValueError("OPENAI_API_KEY가 설정되어 있지 않습니다.")
+        t = time.perf_counter()
+        logger.debug(
+            "[CLEANUP_LLM_START] provider=openai model=%s full_url=%s raw_text_len=%s",
+            model_name,
+            "https://api.openai.com/v1/chat/completions",
+            len(raw_text),
+        )
         client = OpenAI(
             api_key=settings.openai_api_key or None,
             timeout=settings.openai_timeout_sec,
@@ -124,5 +155,12 @@ def preprocess_text_with_llm(
     text = (completion.choices[0].message.content or "").strip()
     if not text:
         raise ValueError("LLM 정제 결과 텍스트가 비어 있습니다.")
+    logger.debug(
+        "[CLEANUP_LLM_DONE] provider=%s model=%s cleaned_len=%s elapsed_ms=%.1f",
+        p,
+        model_name,
+        len(text),
+        (time.perf_counter() - t) * 1000,
+    )
     return text
 

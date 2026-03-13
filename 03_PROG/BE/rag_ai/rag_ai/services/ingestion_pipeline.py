@@ -3,6 +3,7 @@
 # 단계: PDF 바이트 → 텍스트 추출 → 청크 분할 → 임베딩 생성 → Qdrant 저장
 
 import logging
+import time
 from typing import Any
 
 from rag_ai.config import settings
@@ -46,9 +47,29 @@ def run_ingestion(
     size = chunk_size if chunk_size is not None else settings.chunk_size
     overlap = chunk_overlap if chunk_overlap is not None else settings.chunk_overlap
     collection = settings.qdrant_collection
+    source = source_name or "upload"
+
+    total_start = time.perf_counter()
+    logger.debug(
+        "[INGEST_START] source=%s bytes=%s use_llm_cleanup=%s cleanup_provider=%s cleanup_model=%s embedding_provider=%s",
+        source,
+        len(pdf_bytes),
+        use_llm_cleanup,
+        cleanup_provider or settings.cleanup_provider or settings.llm_provider,
+        cleanup_model or "",
+        settings.embedding_provider,
+    )
 
     # 1단계: PDF에서 텍스트 추출
+    t_extract = time.perf_counter()
+    logger.debug("[INGEST_STEP_START] step=extract_text source=%s", source)
     full_text = load_text_from_pdf_bytes(pdf_bytes)
+    logger.debug(
+        "[INGEST_STEP_DONE] step=extract_text source=%s text_len=%s elapsed_ms=%.1f",
+        source,
+        len(full_text),
+        (time.perf_counter() - t_extract) * 1000,
+    )
     if not full_text.strip():
         return {"ok": False, "error": "PDF에서 추출된 텍스트가 없습니다.", "chunks_created": 0}
 
@@ -63,11 +84,12 @@ def run_ingestion(
         provider = (
             cleanup_provider or settings.cleanup_provider or settings.llm_provider
         ).strip().lower()
+        t_cleanup = time.perf_counter()
         logger.debug(
-            "[INGEST_CLEANUP_START] provider=%s model=%s source=%s",
+            "[INGEST_STEP_START] step=llm_cleanup source=%s provider=%s model=%s",
+            source,
             provider,
             cleanup_model or "",
-            source_name or "upload",
         )
         try:
             text_for_chunking = preprocess_text_with_llm(
@@ -81,10 +103,11 @@ def run_ingestion(
                 "llm_cleanup_model": cleanup_model or "",
             }
             logger.debug(
-                "[INGEST_CLEANUP_DONE] provider=%s source=%s cleaned_len=%s",
+                "[INGEST_STEP_DONE] step=llm_cleanup source=%s provider=%s cleaned_len=%s elapsed_ms=%.1f",
+                source,
                 provider,
-                source_name or "upload",
                 len(text_for_chunking),
+                (time.perf_counter() - t_cleanup) * 1000,
             )
         except Exception as e:
             return {
@@ -96,6 +119,8 @@ def run_ingestion(
     # 3단계: 텍스트를 청크로 분할
     # - LLM 정제를 썼다면 '###' 헤더 기준 청킹을 우선 시도
     # - 실패하면 기존 글자수 기반 청킹으로 fallback
+    t_chunk = time.perf_counter()
+    logger.debug("[INGEST_STEP_START] step=chunk source=%s", source)
     chunks = []
     if use_llm_cleanup:
         chunks = chunk_markdown_by_h3(text_for_chunking)
@@ -103,7 +128,7 @@ def run_ingestion(
             logger.debug(
                 "[INGEST_CHUNK] mode=markdown_h3 chunks=%s source=%s",
                 len(chunks),
-                source_name or "upload",
+                source,
             )
 
     if not chunks:
@@ -113,8 +138,14 @@ def run_ingestion(
             len(chunks),
             size,
             overlap,
-            source_name or "upload",
+            source,
         )
+    logger.debug(
+        "[INGEST_STEP_DONE] step=chunk source=%s chunks=%s elapsed_ms=%.1f",
+        source,
+        len(chunks),
+        (time.perf_counter() - t_chunk) * 1000,
+    )
 
     if not chunks:
         return {"ok": False, "error": "생성된 청크가 없습니다.", "chunks_created": 0}
@@ -122,21 +153,59 @@ def run_ingestion(
     # 4단계: 각 청크를 임베딩 벡터로 변환
     # 문서 임베딩도 설정된 embedding_provider를 따라야,
     # 질문 임베딩과 동일한 벡터 공간에서 검색이 정확해집니다.
+    t_embed = time.perf_counter()
+    logger.debug(
+        "[INGEST_STEP_START] step=embed_chunks source=%s provider=%s chunks=%s",
+        source,
+        settings.embedding_provider,
+        len(chunks),
+    )
     vectors = embed_texts(chunks, provider=settings.embedding_provider)
+    logger.debug(
+        "[INGEST_STEP_DONE] step=embed_chunks source=%s vectors=%s dim=%s elapsed_ms=%.1f",
+        source,
+        len(vectors),
+        len(vectors[0]) if vectors else 0,
+        (time.perf_counter() - t_embed) * 1000,
+    )
 
     # 5단계: Qdrant 연결 후 컬렉션 존재 확인(없으면 생성)
+    t_qdrant_prepare = time.perf_counter()
+    logger.debug(
+        "[INGEST_STEP_START] step=qdrant_prepare source=%s host=%s port=%s collection=%s",
+        source,
+        settings.qdrant_host,
+        settings.qdrant_port,
+        collection,
+    )
     client = get_qdrant_client()
     ensure_collection(client, collection, dim=len(vectors[0]) if vectors else 1536)
+    logger.debug(
+        "[INGEST_STEP_DONE] step=qdrant_prepare source=%s elapsed_ms=%.1f",
+        source,
+        (time.perf_counter() - t_qdrant_prepare) * 1000,
+    )
 
     # 6단계: 각 청크에 대한 메타데이터 (출처 등) 구성 후 Qdrant에 저장
-    metadata_list = [{"source": source_name or "upload"}] * len(chunks)
+    t_upsert = time.perf_counter()
+    logger.debug("[INGEST_STEP_START] step=qdrant_upsert source=%s points=%s", source, len(chunks))
+    metadata_list = [{"source": source}] * len(chunks)
     ids = upsert_chunks(client, collection, vectors, chunks, metadata_list=metadata_list)
+    logger.debug(
+        "[INGEST_STEP_DONE] step=qdrant_upsert source=%s inserted=%s elapsed_ms=%.1f",
+        source,
+        len(ids),
+        (time.perf_counter() - t_upsert) * 1000,
+    )
+
+    total_elapsed_ms = (time.perf_counter() - total_start) * 1000
+    logger.debug("[INGEST_DONE] source=%s total_elapsed_ms=%.1f", source, total_elapsed_ms)
 
     return {
         "ok": True,
         "chunks_created": len(chunks),
         "points_upserted": len(ids),
         "collection": collection,
-        "source": source_name or "upload",
+        "source": source,
         **cleanup_meta,
     }
