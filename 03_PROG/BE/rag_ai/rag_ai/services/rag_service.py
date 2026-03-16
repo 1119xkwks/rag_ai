@@ -5,6 +5,7 @@
 # - API 레이어(`/chat/ask`)에서는 HTTP 입/출력만 다루고,
 # - 실제 RAG 로직은 여기 서비스 레이어에 모아두기 위함입니다.
 
+from collections.abc import Callable
 from typing import Any, List
 
 import httpx
@@ -20,6 +21,18 @@ from rag_ai.services.embedding_service import embed_single
 from rag_ai.services.vector_service import ensure_collection, get_qdrant_client, search_similar
 
 logger = logging.getLogger("rag_ai.services.rag")
+
+
+def _strip_vllm_think_prefix(text: str) -> str:
+    """
+    vLLM 응답에 '</think>'가 있고 그 뒤에 본문이 있으면,
+    '</think>'까지 제거하고 뒤 텍스트만 반환합니다.
+    """
+    marker = "</think>"
+    if marker not in text:
+        return text
+    _, tail = text.split(marker, 1)
+    return tail.strip() if tail.strip() else text
 
 
 def _llm_full_url(provider: str, model_name: str) -> str:
@@ -91,6 +104,7 @@ def answer_with_rag(
     llm_provider_override: str | None = None,
     embedding_provider_override: str | None = None,
     llm_model_override: str | None = None,
+    progress_callback: Callable[[str], None] | None = None,
 ) -> dict[str, Any]:
     """
     질문을 받아 RAG 방식으로 답변을 생성합니다.
@@ -107,6 +121,26 @@ def answer_with_rag(
         answer: 최종 답변
         contexts: 사용된 검색 결과(원문/score/source 등)
     """
+    def _progress(message: str) -> None:
+        if progress_callback is not None:
+            try:
+                progress_callback(message)
+            except Exception:
+                # 진행 로그 실패가 본 로직을 깨지 않도록 무시합니다.
+                pass
+
+    def _emit_payload_chunks(prefix: str, payload_json: str, chunk_size: int = 2000) -> None:
+        """
+        긴 payload를 로그 누락 없이 확인할 수 있도록 chunk 단위로 기록합니다.
+        """
+        total = len(payload_json)
+        logger.info("%s payload_len=%s", prefix, total)
+        _progress(f"{prefix} payload_len={total}")
+        for i, start in enumerate(range(0, total, chunk_size), start=1):
+            chunk = payload_json[start : start + chunk_size]
+            logger.info("%s payload_chunk[%s]=%s", prefix, i, chunk)
+            _progress(f"{prefix} payload_chunk[{i}]={chunk}")
+
     if not question or not question.strip():
         return {"ok": False, "error": "question이 비어 있습니다."}
 
@@ -128,6 +162,10 @@ def answer_with_rag(
             "ok": False,
             "error": "embedding_provider는 openai, vllm, gemini 중 하나여야 합니다.",
         }
+
+    _progress(
+        f"RAG 시작: provider={provider}, embedding_provider={embedding_provider}, top_k={top_k}, source={source or '-'}"
+    )
 
     # LLM provider가 OpenAI일 때만 OPENAI_API_KEY를 필수로 체크합니다.
     if provider == "openai" and not settings.openai_api_key:
@@ -151,6 +189,7 @@ def answer_with_rag(
 
     # 1) 질문을 임베딩해서 벡터로 변환합니다.
     t0 = time.perf_counter()
+    _progress("1/3 질문 임베딩 생성 중...")
     logger.debug(
         "[RAG_STEP_START] step=embed_question provider=%s full_url=%s question_len=%s",
         embedding_provider,
@@ -180,6 +219,7 @@ def answer_with_rag(
         }
     if not query_vector:
         return {"ok": False, "error": "질문 임베딩 생성에 실패했습니다."}
+    _progress(f"1/3 질문 임베딩 완료 (dim={len(query_vector)})")
     logger.debug(
         "[RAG_STEP_DONE] step=embed_question provider=%s vector_dim=%s elapsed_ms=%.1f",
         embedding_provider,
@@ -190,6 +230,7 @@ def answer_with_rag(
     # 2) Qdrant에서 유사한 청크를 검색합니다.
     #    연결 실패 시 "어디로 붙으려 했는지(host/port)"를 같이 반환해 진단을 쉽게 합니다.
     t1 = time.perf_counter()
+    _progress("2/3 Qdrant 유사도 검색 중...")
     logger.debug(
         "[RAG_STEP_START] step=qdrant_search host=%s port=%s collection=%s top_k=%s source=%s",
         settings.qdrant_host,
@@ -223,6 +264,7 @@ def answer_with_rag(
                 f"collection={settings.qdrant_collection}, detail={e!s}"
             ),
         }
+    _progress(f"2/3 Qdrant 검색 완료 (hits={len(hits)})")
     logger.debug(
         "[RAG_STEP_DONE] step=qdrant_search hits=%s elapsed_ms=%.1f",
         len(hits),
@@ -235,6 +277,7 @@ def answer_with_rag(
     # 4) LLM에게 “문서 컨텍스트 기반으로 답변”하도록 요청합니다.
     #    - 아직 스트리밍/툴 호출은 하지 않고, 가장 단순한 형태로 구현합니다.
     t2 = time.perf_counter()
+    _progress("3/3 LLM 답변 생성 중...")
     logger.debug(
         "[RAG_STEP_START] step=llm_generate provider=%s model=%s full_url=%s context_len=%s",
         provider,
@@ -249,7 +292,6 @@ def answer_with_rag(
         ),
         len(context),
     )
-
     # provider 설정에 따라 OpenAI 또는 vLLM(OpenAI 호환) 클라이언트를 생성합니다.
     if provider == "vllm":
         # 회사 내부 vLLM 서버: OpenAI 호환 엔드포인트를 사용합니다.
@@ -316,6 +358,17 @@ def answer_with_rag(
             _llm_full_url(provider, model_name),
             json.dumps(llm_payload, ensure_ascii=False),
         )
+        if provider == "vllm":
+            payload_json = json.dumps(llm_payload, ensure_ascii=False)
+            full_url = _llm_full_url(provider, model_name)
+            logger.info(
+                "[LLM_PAYLOAD_JSON] provider=%s full_url=%s payload=%s",
+                provider,
+                full_url,
+                payload_json,
+            )
+            _progress(f"vLLM 요청 전송: url={full_url}")
+            _emit_payload_chunks("[vLLM_PAYLOAD]", payload_json)
 
     if provider == "gemini":
         gemini_payload = {
@@ -357,6 +410,14 @@ def answer_with_rag(
                 response.raise_for_status()
                 data = response.json()
         except httpx.TimeoutException:
+            logger.error(
+                "[RAG_LLM_ERROR] provider=gemini model=%s timeout_sec=%s",
+                model_name,
+                settings.gemini_timeout_sec,
+            )
+            _progress(
+                f"Gemini LLM timeout: model={model_name}, timeout_sec={settings.gemini_timeout_sec}"
+            )
             return {
                 "ok": False,
                 "error": (
@@ -387,10 +448,22 @@ def answer_with_rag(
                 temperature=0.2,  # 너무 창의적이지 않게(근거 기반 답변 유도)
             )
             answer = (completion.choices[0].message.content or "").strip()
+            if provider == "vllm":
+                answer = _strip_vllm_think_prefix(answer)
         except APIConnectionError as e:
             # 내부망 LLM 서버(vLLM) 접근 실패 시 원인 파악이 쉽도록 endpoint 정보를 포함해 반환
             # 예: VPN 미연결, 방화벽 차단, 서버 down, 잘못된 IP/포트
             endpoint = settings.vllm_api_url if provider == "vllm" else "openai"
+            logger.error(
+                "[RAG_LLM_ERROR] provider=%s endpoint=%s model=%s detail=%s",
+                provider,
+                endpoint,
+                model_name,
+                e,
+            )
+            _progress(
+                f"LLM 연결 오류: provider={provider}, endpoint={endpoint}, model={model_name}, detail={e!s}"
+            )
             return {
                 "ok": False,
                 "error": (
@@ -399,12 +472,39 @@ def answer_with_rag(
                 ),
             }
         except APITimeoutError:
+            timeout_sec = settings.vllm_timeout_sec if provider == "vllm" else settings.openai_timeout_sec
+            logger.error(
+                "[RAG_LLM_ERROR] provider=%s model=%s timeout_sec=%s",
+                provider,
+                model_name,
+                timeout_sec,
+            )
+            _progress(
+                f"LLM timeout: provider={provider}, model={model_name}, timeout_sec={timeout_sec}"
+            )
             return {
                 "ok": False,
                 "error": (
                     "LLM 요청이 timeout 되었습니다. "
                     f"provider={provider}, model={model_name}, "
                     f"timeout_sec={settings.vllm_timeout_sec if provider == 'vllm' else settings.openai_timeout_sec}"
+                ),
+            }
+        except Exception as e:
+            logger.error(
+                "[RAG_LLM_ERROR] provider=%s model=%s detail=%s",
+                provider,
+                model_name,
+                e,
+            )
+            _progress(
+                f"LLM 호출 실패: provider={provider}, model={model_name}, detail={e!s}"
+            )
+            return {
+                "ok": False,
+                "error": (
+                    "LLM 호출 중 오류가 발생했습니다. "
+                    f"provider={provider}, model={model_name}, detail={e!s}"
                 ),
             }
 
@@ -415,6 +515,7 @@ def answer_with_rag(
         len(answer),
         (time.perf_counter() - t2) * 1000,
     )
+    _progress(f"3/3 LLM 답변 생성 완료 (answer_len={len(answer)})")
 
     return {
         "ok": True,

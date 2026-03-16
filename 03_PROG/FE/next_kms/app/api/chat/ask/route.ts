@@ -24,6 +24,9 @@ function getBackendBaseUrl(): string {
   return process.env.BACKEND_BASE_URL || "http://127.0.0.1:8000";
 }
 
+const CHAT_ASK_TIMEOUT_MS = 60 * 60 * 1000; // 1시간
+export const maxDuration = 3600;
+
 export async function POST(req: Request) {
   // 1) 클라이언트가 보낸 JSON을 파싱합니다.
   const body = (await req.json()) as ChatAskRequest;
@@ -47,17 +50,46 @@ export async function POST(req: Request) {
     embedding_provider: (body.embedding_provider || "").trim(),
   };
 
-  // 4) FastAPI 백엔드로 요청을 전달합니다.
-  const backendUrl = `${getBackendBaseUrl()}/chat/ask`;
-  const res = await fetch(backendUrl, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(payload),
-  });
+  // 4) FastAPI 백엔드로 SSE 요청을 전달합니다.
+  const backendUrl = `${getBackendBaseUrl()}/chat/ask-stream`;
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), CHAT_ASK_TIMEOUT_MS);
 
-  // 5) 백엔드 응답을 그대로 반환합니다.
-  //    (ok/answer/contexts 등 응답 포맷은 FastAPI 쪽 구현을 따릅니다.)
-  const data = await res.json();
-  return NextResponse.json(data, { status: res.status });
+  let res: Response;
+  try {
+    res = await fetch(backendUrl, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+      signal: controller.signal,
+    });
+  } catch (e) {
+    clearTimeout(timeoutId);
+    const msg =
+      e instanceof Error && e.name === "AbortError"
+        ? "채팅 응답이 1시간 내에 완료되지 않아 중단되었습니다."
+        : String(e);
+    return NextResponse.json({ ok: false, error: msg }, { status: 504 });
+  }
+  clearTimeout(timeoutId);
+
+  if (!res.ok || !res.body) {
+    const text = await res.text();
+    try {
+      const data = JSON.parse(text);
+      return NextResponse.json(data, { status: res.status });
+    } catch {
+      return NextResponse.json({ ok: false, error: text || res.statusText }, { status: res.status });
+    }
+  }
+
+  return new Response(res.body, {
+    status: res.status,
+    headers: {
+      "Content-Type": "text/event-stream",
+      "Cache-Control": "no-cache",
+      Connection: "keep-alive",
+    },
+  });
 }
 

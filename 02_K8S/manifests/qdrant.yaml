@@ -1,4 +1,5 @@
 # How to re-create (kubectl):
+#   kubectl apply  -f 02_K8S/manifests/qdrant-pvc.yaml
 #   kubectl delete -f 02_K8S/manifests/qdrant.yaml --ignore-not-found
 #   kubectl apply  -f 02_K8S/manifests/qdrant.yaml
 #   kubectl get deploy qdrant
@@ -11,24 +12,6 @@
 #   # 필요 시 롤백
 #   kubectl rollout undo deploy/qdrant
 
----
-apiVersion: v1
-kind: PersistentVolumeClaim
-metadata:
-  name: qdrant-pvc
-  labels:
-    app: qdrant
-spec:
-  accessModes:
-    - ReadWriteOnce
-  resources:
-    requests:
-      storage: 10Gi
-  # storageClassName 생략 시 클러스터의 default StorageClass 사용
-  # 사용 가능한 목록: kubectl get storageclass
-  # 기본 지정: kubectl patch storageclass <이름> -p '{"metadata": {"annotations":{"storageclass.kubernetes.io/is-default-class":"true"}}}'
-
----
 apiVersion: apps/v1
 kind: Deployment
 metadata:

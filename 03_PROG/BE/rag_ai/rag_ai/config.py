@@ -63,6 +63,10 @@ class Settings(BaseSettings):
     openai_timeout_sec: float = 60.0
     vllm_timeout_sec: float = 120.0
     gemini_timeout_sec: float = 120.0
+    # cleanup 시 원문이 이 글자 수를 넘으면 Gemini Files API로 첨부해 요청 (0이면 항상 인라인)
+    gemini_cleanup_file_threshold_chars: int = 30_000
+    # Gemini cleanup 최대 출력 토큰 수 (과도한 토큰 사용/쿼터 소모 방지)
+    gemini_cleanup_max_output_tokens: int = 4096
 
     # ----- Logging 설정 -----
     # DEBUG / INFO / WARNING / ERROR 중 하나를 사용합니다.

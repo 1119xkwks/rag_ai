@@ -50,10 +50,12 @@ export default function IngestPage() {
   const [cleanupProvider, setCleanupProvider] = useState<Provider>("gemini");
   const [cleanupModel, setCleanupModel] = useState("");
   const [cleanupDelimiter, setCleanupDelimiter] = useState("###");
+  const [cleanupSendAsFile, setCleanupSendAsFile] = useState(false);
   const [cleanupModels, setCleanupModels] = useState<string[]>([]);
   const [cleanupModelsLoading, setCleanupModelsLoading] = useState(false);
   const [cleanupModelsError, setCleanupModelsError] = useState("");
   const [cleanupLoading, setCleanupLoading] = useState(false);
+  const [cleanupLogs, setCleanupLogs] = useState<string[]>([]);
   const [cleanedText, setCleanedText] = useState("");
 
   const [preferMarkdownH3, setPreferMarkdownH3] = useState(true);
@@ -118,6 +120,20 @@ export default function IngestPage() {
   }, [cleanupProvider, useCleanup]);
 
   const textForChunking = useMemo(() => (cleanedText || rawText).trim(), [cleanedText, rawText]);
+  const resolvedSourceName = useMemo(() => {
+    const trimmed = sourceName.trim();
+    if (trimmed) return trimmed;
+    if (pdfFile?.name?.trim()) return pdfFile.name.trim();
+    return "upload";
+  }, [sourceName, pdfFile]);
+
+  useEffect(() => {
+    // PDF를 고르면 source를 파일명으로 기본 채움(사용자가 이후 자유롭게 수정 가능)
+    if (!pdfFile) return;
+    if (!sourceName.trim()) {
+      setSourceName(pdfFile.name);
+    }
+  }, [pdfFile, sourceName]);
 
   function cancelExtract() {
     extractAbortRef.current?.abort();
@@ -229,8 +245,9 @@ export default function IngestPage() {
     if (!rawText.trim() || cleanupLoading) return;
     setCleanupLoading(true);
     setStatusMsg("");
+    setCleanupLogs([]);
     try {
-      const res = await fetch("/api/documents/cleanup-text", {
+      const res = await fetch("/api/documents/cleanup-text-stream", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -239,16 +256,84 @@ export default function IngestPage() {
           cleanup_provider: cleanupProvider,
           cleanup_model: cleanupModel,
           cleanup_delimiter: cleanupDelimiter,
+          cleanup_send_as_file: cleanupSendAsFile,
         }),
       });
-      const data = (await res.json()) as CleanupResponse;
-      if (!data.ok) return void setStatusMsg(`3단계 실패: ${data.error || "알 수 없는 오류"}`);
-      setCleanedText(data.text || "");
-      setChunks([]);
-      setChunkMode("");
-      setStatusMsg(
-        `3단계 완료: ${data.cleanup_used ? "LLM 정제 적용" : "정제 생략"} / ${data.text_len || 0}자`,
-      );
+      if (!res.ok || !res.body) {
+        const err = (await res.json()) as { ok?: boolean; error?: string };
+        setStatusMsg(`3단계 실패: ${err.error || res.statusText}`);
+        return;
+      }
+
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = "";
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        const blocks = buffer.split("\n\n");
+        buffer = blocks.pop() ?? "";
+        for (const block of blocks) {
+          const m = block.match(/^data:\s*(\{[\s\S]*\})/);
+          if (!m) continue;
+          try {
+            const payload = JSON.parse(m[1]) as {
+              type: string;
+              message?: string;
+              ok?: boolean;
+              text?: string;
+              text_len?: number;
+              cleanup_used?: boolean;
+              error?: string;
+            };
+            if (payload.type === "log" && payload.message != null) {
+              setCleanupLogs((prev) => [...prev, payload.message ?? ""]);
+            } else if (payload.type === "result" && payload.ok) {
+              setCleanedText(payload.text || "");
+              setChunks([]);
+              setChunkMode("");
+              setStatusMsg(
+                `3단계 완료: ${payload.cleanup_used ? "LLM 정제 적용" : "정제 생략"} / ${payload.text_len || 0}자`,
+              );
+            } else if (payload.type === "error" || (payload.type === "result" && !payload.ok)) {
+              setStatusMsg(`3단계 실패: ${payload.error || "알 수 없는 오류"}`);
+            }
+          } catch {
+            // ignore parse error for partial chunk
+          }
+        }
+      }
+      if (buffer.trim()) {
+        const m = buffer.match(/^data:\s*(\{[\s\S]*\})/);
+        if (m) {
+          try {
+            const payload = JSON.parse(m[1]) as {
+              type: string;
+              message?: string;
+              ok?: boolean;
+              text?: string;
+              text_len?: number;
+              cleanup_used?: boolean;
+              error?: string;
+            };
+            if (payload.type === "log" && payload.message != null) {
+              setCleanupLogs((prev) => [...prev, payload.message ?? ""]);
+            } else if (payload.type === "result" && payload.ok) {
+              setCleanedText(payload.text || "");
+              setChunks([]);
+              setChunkMode("");
+              setStatusMsg(
+                `3단계 완료: ${payload.cleanup_used ? "LLM 정제 적용" : "정제 생략"} / ${payload.text_len || 0}자`,
+              );
+            } else if (payload.type === "error" || (payload.type === "result" && !payload.ok)) {
+              setStatusMsg(`3단계 실패: ${payload.error || "알 수 없는 오류"}`);
+            }
+          } catch {
+            // ignore
+          }
+        }
+      }
     } catch (e) {
       setStatusMsg(`3단계 네트워크 오류: ${String(e)}`);
     } finally {
@@ -293,7 +378,7 @@ export default function IngestPage() {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          source_name: sourceName.trim(),
+          source_name: resolvedSourceName,
           chunks,
           embedding_provider: embeddingProvider,
         }),
@@ -301,7 +386,7 @@ export default function IngestPage() {
       const data = (await res.json()) as SaveResponse;
       if (!data.ok) return void setStatusMsg(`5단계 실패: ${data.error || "알 수 없는 오류"}`);
       setStatusMsg(
-        `5단계 완료: source=${data.source || "-"}, points=${data.points_upserted || 0}, collection=${data.collection || "-"}`,
+        `5단계 완료: source=${data.source || resolvedSourceName}, points=${data.points_upserted || 0}, collection=${data.collection || "-"}`,
       );
     } catch (e) {
       setStatusMsg(`5단계 네트워크 오류: ${String(e)}`);
@@ -476,6 +561,17 @@ export default function IngestPage() {
               />
             </label>
           </div>
+          <div className="mt-2">
+            <label className="flex items-center gap-2 text-sm">
+              <input
+                type="checkbox"
+                checked={cleanupSendAsFile}
+                onChange={(e) => setCleanupSendAsFile(e.target.checked)}
+                disabled={!useCleanup || cleanupProvider !== "gemini"}
+              />
+              <span>Gemini cleanup 요청을 txt 첨부파일로 보내기</span>
+            </label>
+          </div>
           {cleanupModelsError ? (
             <p className="mt-2 text-xs text-red-600 dark:text-red-400">정제 모델 목록 오류: {cleanupModelsError}</p>
           ) : null}
@@ -493,6 +589,18 @@ export default function IngestPage() {
               {cleanupLoading ? "정제 중..." : "정제 실행"}
             </button>
           </div>
+          {cleanupLogs.length > 0 ? (
+            <div className="mt-3">
+              <p className="mb-1 text-xs font-medium text-zinc-600 dark:text-zinc-400">
+                정제 실시간 로그 (SSE)
+              </p>
+              <pre className="max-h-48 overflow-y-auto rounded-xl border border-zinc-200 bg-zinc-100 p-3 text-xs text-zinc-800 dark:border-zinc-800 dark:bg-zinc-900 dark:text-zinc-200">
+                {cleanupLogs.map((line, i) => (
+                  <div key={i}>{line}</div>
+                ))}
+              </pre>
+            </div>
+          ) : null}
           <textarea
             value={cleanedText}
             onChange={(e) => setCleanedText(e.target.value)}
@@ -576,6 +684,9 @@ export default function IngestPage() {
                 onChange={(e) => setSourceName(e.target.value)}
                 className="h-10 rounded-xl border border-zinc-200 bg-white px-3 text-sm outline-none focus:border-zinc-400 dark:border-zinc-800 dark:bg-zinc-950 dark:focus:border-zinc-600"
               />
+              <span className="text-[11px] text-zinc-500 dark:text-zinc-400">
+                저장될 source: <code>{resolvedSourceName}</code>
+              </span>
             </label>
             <label className="flex flex-col gap-1">
               <span className="text-xs font-medium text-zinc-600 dark:text-zinc-400">embedding provider</span>

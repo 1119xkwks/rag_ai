@@ -1,6 +1,7 @@
 # text_cleanup_service.py
 # PDF에서 추출된 난잡한 텍스트를 LLM으로 정제해
 # "### 헤더 + 본문" 형태의 마크다운으로 바꾸는 서비스입니다.
+# Gemini일 때 원문이 길면 Files API로 첨부해 요청합니다.
 
 from typing import Any
 
@@ -12,6 +13,12 @@ from openai import OpenAI
 from rag_ai.config import settings
 
 logger = logging.getLogger("rag_ai.services.text_cleanup")
+
+_GEMINI_UPLOAD_BASE = "https://generativelanguage.googleapis.com/upload/v1beta"
+_GEMINI_FILES_BASE = "https://generativelanguage.googleapis.com/v1beta"
+_GEMINI_MAX_RETRIES = 5
+_GEMINI_BACKOFF_BASE_SEC = 2.0
+_GEMINI_BACKOFF_MAX_SEC = 30.0
 
 
 def _default_model_for_provider(provider: str) -> str:
@@ -44,10 +51,177 @@ def _build_cleanup_prompt(raw_text: str) -> str:
     )
 
 
+def _build_cleanup_prompt_file_instruction_only() -> str:
+    """첨부 파일용: 원문 없이 지시문만 반환합니다."""
+    return (
+        "첨부한 원문 파일을 정제해서 마크다운으로 출력해 주세요.\n"
+        "500~1000자 정도의 의미 있는 청크로 분할해 주세요.\n"
+        "루비(주석)는 생략하고 본문만 추출해 주세요.\n"
+        "원문 내용은 생략하지 말고 최대한 보존해 주세요.\n"
+        "각 청크는 반드시 '### '로 시작하는 짧은 요약 헤더를 포함해 주세요.\n"
+        "출력은 순수 마크다운 텍스트만 출력해 주세요."
+    )
+
+
+def _gemini_upload_text_file(raw_text: str, timeout_sec: float) -> tuple[str, str]:
+    """
+    Gemini Files API로 텍스트를 업로드하고 (file_uri, file_name)을 반환합니다.
+    file_name은 삭제 시 사용합니다.
+    """
+    file_bytes = raw_text.encode("utf-8")
+    num_bytes = len(file_bytes)
+    mime_type = "text/plain"
+    display_name = "cleanup_raw.txt"
+
+    start_url = f"{_GEMINI_UPLOAD_BASE}/files"
+    with httpx.Client(
+        timeout=httpx.Timeout(
+            connect=30.0,
+            read=timeout_sec,
+            write=max(60.0, timeout_sec),
+            pool=30.0,
+        )
+    ) as client:
+        start_res = client.post(
+            start_url,
+            params={"key": settings.gemini_api_key},
+            headers={
+                "X-Goog-Upload-Protocol": "resumable",
+                "X-Goog-Upload-Command": "start",
+                "X-Goog-Upload-Header-Content-Length": str(num_bytes),
+                "X-Goog-Upload-Header-Content-Type": mime_type,
+                "Content-Type": "application/json",
+            },
+            json={"file": {"display_name": display_name}},
+        )
+        start_res.raise_for_status()
+        upload_url = start_res.headers.get("x-goog-upload-url")
+        if not upload_url:
+            raise ValueError("Gemini 파일 업로드 시작 응답에 x-goog-upload-url이 없습니다.")
+
+        upload_res = client.post(
+            upload_url,
+            headers={
+                "Content-Length": str(num_bytes),
+                "X-Goog-Upload-Offset": "0",
+                "X-Goog-Upload-Command": "upload, finalize",
+            },
+            content=file_bytes,
+        )
+        upload_res.raise_for_status()
+        data: dict[str, Any] = upload_res.json()
+    file_info = data.get("file") or {}
+    file_uri = file_info.get("fileUri") or file_info.get("uri") or ""
+    file_name = (file_info.get("name") or "").strip()
+    if not file_uri:
+        raise ValueError("Gemini 파일 업로드 응답에 file_uri가 없습니다.")
+    return file_uri, file_name
+
+
+def _parse_retry_after_seconds(retry_after: str | None) -> float | None:
+    """Retry-After 헤더(초 단위 정수)를 파싱합니다."""
+    if not retry_after:
+        return None
+    try:
+        sec = float(retry_after.strip())
+        return sec if sec >= 0 else None
+    except Exception:
+        return None
+
+
+def _gemini_generate_with_retry(
+    *,
+    client: httpx.Client,
+    url: str,
+    params: dict[str, str],
+    payload: dict[str, Any],
+) -> dict[str, Any]:
+    """Gemini generateContent 호출(429/5xx 재시도 포함)."""
+    last_error: Exception | None = None
+    for attempt in range(1, _GEMINI_MAX_RETRIES + 1):
+        try:
+            res = client.post(url, params=params, json=payload)
+            if res.status_code in {429, 500, 502, 503, 504}:
+                retry_after = _parse_retry_after_seconds(res.headers.get("Retry-After"))
+                if attempt >= _GEMINI_MAX_RETRIES:
+                    res.raise_for_status()
+                backoff = retry_after if retry_after is not None else min(
+                    _GEMINI_BACKOFF_BASE_SEC * (2 ** (attempt - 1)),
+                    _GEMINI_BACKOFF_MAX_SEC,
+                )
+                logger.warning(
+                    "[CLEANUP_LLM_RETRY] provider=gemini status=%s attempt=%s/%s wait_sec=%.1f",
+                    res.status_code,
+                    attempt,
+                    _GEMINI_MAX_RETRIES,
+                    backoff,
+                )
+                time.sleep(backoff)
+                continue
+            res.raise_for_status()
+            return res.json()
+        except httpx.HTTPStatusError as e:
+            last_error = e
+            if attempt >= _GEMINI_MAX_RETRIES:
+                raise
+            backoff = min(
+                _GEMINI_BACKOFF_BASE_SEC * (2 ** (attempt - 1)),
+                _GEMINI_BACKOFF_MAX_SEC,
+            )
+            logger.warning(
+                "[CLEANUP_LLM_RETRY] provider=gemini http_status_error attempt=%s/%s wait_sec=%.1f err=%s",
+                attempt,
+                _GEMINI_MAX_RETRIES,
+                backoff,
+                e,
+            )
+            time.sleep(backoff)
+        except httpx.HTTPError as e:
+            last_error = e
+            if attempt >= _GEMINI_MAX_RETRIES:
+                raise
+            backoff = min(
+                _GEMINI_BACKOFF_BASE_SEC * (2 ** (attempt - 1)),
+                _GEMINI_BACKOFF_MAX_SEC,
+            )
+            logger.warning(
+                "[CLEANUP_LLM_RETRY] provider=gemini http_error attempt=%s/%s wait_sec=%.1f err=%s",
+                attempt,
+                _GEMINI_MAX_RETRIES,
+                backoff,
+                e,
+            )
+            time.sleep(backoff)
+
+    if last_error:
+        raise last_error
+    raise ValueError("Gemini generateContent 호출 실패")
+
+
+def _strip_vllm_think_prefix(text: str) -> str:
+    """
+    vLLM 응답에 '</think>'가 포함되고 그 뒤에 실제 본문이 있으면,
+    '</think>'까지 제거하고 뒤 텍스트만 반환합니다.
+    """
+    marker = "</think>"
+    if marker not in text:
+        return text
+    head, tail = text.split(marker, 1)
+    if not tail.strip():
+        return text
+    logger.debug(
+        "[CLEANUP_LLM] provider=vllm think-prefix 제거 적용 before_len=%s after_len=%s",
+        len(text),
+        len(tail.strip()),
+    )
+    return tail.strip()
+
+
 def preprocess_text_with_llm(
     raw_text: str,
     provider: str,
     model_override: str | None = None,
+    gemini_use_file: bool | None = None,
 ) -> str:
     """
     원문 텍스트를 LLM으로 정제해 마크다운 문자열로 반환합니다.
@@ -56,6 +230,10 @@ def preprocess_text_with_llm(
         raw_text: PDF 추출 원문 텍스트
         provider: openai | vllm | gemini
         model_override: 사용 모델 강제 지정(선택)
+        gemini_use_file:
+            - None: 길이 임계값 기준으로 자동 선택
+            - True: Gemini Files API로 txt 첨부 강제
+            - False: 인라인 텍스트 강제
     """
     p = (provider or "").strip().lower()
     if p not in {"openai", "vllm", "gemini"}:
@@ -71,14 +249,37 @@ def preprocess_text_with_llm(
         if not settings.gemini_api_key:
             raise ValueError("GEMINI_API_KEY가 설정되어 있지 않습니다.")
 
-        url = (
-            f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent"
+        threshold = getattr(settings, "gemini_cleanup_file_threshold_chars", 30_000)
+        use_file = (
+            gemini_use_file
+            if gemini_use_file is not None
+            else (threshold > 0 and len(raw_text) > threshold)
         )
+
+        if use_file:
+            prompt = _build_cleanup_prompt_file_instruction_only()
+            t = time.perf_counter()
+            logger.info(
+                "[CLEANUP_LLM] provider=gemini raw_text_len=%s → Files API 첨부 업로드",
+                len(raw_text),
+            )
+            file_uri, file_name = _gemini_upload_text_file(
+                raw_text, settings.gemini_timeout_sec
+            )
+            user_parts = [
+                {"text": prompt},
+                {"file_data": {"mime_type": "text/plain", "file_uri": file_uri}},
+            ]
+        else:
+            prompt = _build_cleanup_prompt(raw_text)
+            user_parts = [{"text": prompt}]
+
+        url = f"{_GEMINI_FILES_BASE}/models/{model_name}:generateContent"
         t = time.perf_counter()
         logger.debug(
-            "[CLEANUP_LLM_START] provider=gemini model=%s full_url=%s raw_text_len=%s",
+            "[CLEANUP_LLM_START] provider=gemini model=%s use_file=%s raw_text_len=%s",
             model_name,
-            url,
+            use_file,
             len(raw_text),
         )
         timeout = httpx.Timeout(
@@ -88,18 +289,31 @@ def preprocess_text_with_llm(
             pool=min(settings.gemini_timeout_sec, 30.0),
         )
 
-        with httpx.Client(timeout=timeout) as client:
-            res = client.post(
-                url,
-                params={"key": settings.gemini_api_key},
-                json={
-                    "system_instruction": {"parts": [{"text": system_text}]},
-                    "contents": [{"role": "user", "parts": [{"text": prompt}]}],
-                    "generationConfig": {"temperature": 0.0},
-                },
-            )
-            res.raise_for_status()
-            data: dict[str, Any] = res.json()
+        try:
+            with httpx.Client(timeout=timeout) as client:
+                data = _gemini_generate_with_retry(
+                    client=client,
+                    url=url,
+                    params={"key": settings.gemini_api_key},
+                    payload={
+                        "system_instruction": {"parts": [{"text": system_text}]},
+                        "contents": [{"role": "user", "parts": user_parts}],
+                    "generationConfig": {
+                        "temperature": 0.0,
+                        "maxOutputTokens": max(
+                            256,
+                            int(getattr(settings, "gemini_cleanup_max_output_tokens", 4096)),
+                        ),
+                    },
+                    },
+                )
+        except httpx.HTTPStatusError as e:
+            if e.response is not None and e.response.status_code == 429:
+                raise ValueError(
+                    "Gemini rate limit(429)에 걸렸습니다. 잠시 후 다시 시도하거나, "
+                    "다른 cleanup provider(OpenAI/vLLM)로 실행해 주세요."
+                ) from e
+            raise
 
         candidates = data.get("candidates", [])
         if not candidates:
@@ -114,6 +328,22 @@ def preprocess_text_with_llm(
             len(text),
             (time.perf_counter() - t) * 1000,
         )
+
+        if use_file and file_name:
+            try:
+                delete_name = file_name
+                if delete_name.startswith("files/"):
+                    delete_name = delete_name[len("files/"):]
+                del_res = httpx.delete(
+                    f"{_GEMINI_FILES_BASE}/files/{delete_name}",
+                    params={"key": settings.gemini_api_key},
+                    timeout=10.0,
+                )
+                if del_res.is_success:
+                    logger.debug("[CLEANUP_LLM] Gemini 업로드 파일 삭제 완료 name=%s", file_name)
+            except Exception as e:
+                logger.debug("[CLEANUP_LLM] Gemini 업로드 파일 삭제 무시: %s", e)
+
         return text
 
     if p == "vllm":
@@ -153,6 +383,8 @@ def preprocess_text_with_llm(
         temperature=0.0,
     )
     text = (completion.choices[0].message.content or "").strip()
+    if p == "vllm":
+        text = _strip_vllm_think_prefix(text)
     if not text:
         raise ValueError("LLM 정제 결과 텍스트가 비어 있습니다.")
     logger.debug(

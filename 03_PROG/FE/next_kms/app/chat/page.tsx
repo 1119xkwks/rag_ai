@@ -21,6 +21,7 @@ type ChatLlmProvider = "openai" | "vllm" | "gemini";
 type ChatEmbeddingProvider = "openai" | "vllm" | "gemini";
 
 type ChatAskResponse = {
+  type?: string;
   ok: boolean;
   answer?: string;
   contexts?: RagContextHit[];
@@ -51,6 +52,7 @@ export default function ChatPage() {
   const [embeddingProvider, setEmbeddingProvider] =
     useState<ChatEmbeddingProvider>("gemini");
   const [isLoading, setIsLoading] = useState(false);
+  const [askLogs, setAskLogs] = useState<string[]>([]);
 
   const [messages, setMessages] = useState<ChatMessage[]>([
     {
@@ -125,6 +127,7 @@ export default function ChatPage() {
 
     // 2) 로딩 상태를 켠 뒤, 백엔드로 질문을 보냅니다.
     setIsLoading(true);
+    setAskLogs([]);
 
     try {
       const res = await fetch("/api/chat/ask", {
@@ -140,9 +143,9 @@ export default function ChatPage() {
         }),
       });
 
-      const data = (await res.json()) as ChatAskResponse;
-      if (!data.ok) {
-        const errText = data.error || "알 수 없는 오류가 발생했습니다.";
+      if (!res.ok || !res.body) {
+        const data = (await res.json()) as ChatAskResponse;
+        const errText = data.error || res.statusText || "알 수 없는 오류가 발생했습니다.";
         const assistantMsg: ChatMessage = {
           id: crypto.randomUUID(),
           role: "assistant",
@@ -154,15 +157,106 @@ export default function ChatPage() {
         return;
       }
 
-      // 3) 정상 응답이면, assistant 답변과 contexts(근거)를 화면에 반영합니다.
-      const assistantMsg: ChatMessage = {
-        id: crypto.randomUUID(),
-        role: "assistant",
-        content: (data.answer || "").trim(),
-      };
-      lastAssistantIdRef.current = assistantMsg.id;
-      setMessages((prev) => [...prev, assistantMsg]);
-      setContexts(data.contexts || []);
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = "";
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        const blocks = buffer.split("\n\n");
+        buffer = blocks.pop() ?? "";
+
+        for (const block of blocks) {
+          const m = block.match(/^data:\s*(\{[\s\S]*\})/);
+          if (!m) continue;
+          try {
+            const payload = JSON.parse(m[1]) as ChatAskResponse & {
+              message?: string;
+            };
+            if (payload.type === "log" && payload.message != null) {
+              setAskLogs((prev) => [...prev, payload.message ?? ""]);
+            } else if (payload.type === "result") {
+              if (!payload.ok) {
+                const errText = payload.error || "알 수 없는 오류가 발생했습니다.";
+                const assistantMsg: ChatMessage = {
+                  id: crypto.randomUUID(),
+                  role: "assistant",
+                  content: `오류: ${errText}`,
+                };
+                lastAssistantIdRef.current = assistantMsg.id;
+                setMessages((prev) => [...prev, assistantMsg]);
+                setContexts([]);
+              } else {
+                const assistantMsg: ChatMessage = {
+                  id: crypto.randomUUID(),
+                  role: "assistant",
+                  content: (payload.answer || "").trim(),
+                };
+                lastAssistantIdRef.current = assistantMsg.id;
+                setMessages((prev) => [...prev, assistantMsg]);
+                setContexts(payload.contexts || []);
+              }
+            } else if (payload.type === "error") {
+              const assistantMsg: ChatMessage = {
+                id: crypto.randomUUID(),
+                role: "assistant",
+                content: `오류: ${payload.error || "알 수 없는 오류가 발생했습니다."}`,
+              };
+              lastAssistantIdRef.current = assistantMsg.id;
+              setMessages((prev) => [...prev, assistantMsg]);
+              setContexts([]);
+            }
+          } catch {
+            // ignore parse error for partial chunk
+          }
+        }
+      }
+      if (buffer.trim()) {
+        const m = buffer.match(/^data:\s*(\{[\s\S]*\})/);
+        if (m) {
+          try {
+            const payload = JSON.parse(m[1]) as ChatAskResponse & {
+              message?: string;
+            };
+            if (payload.type === "log" && payload.message != null) {
+              setAskLogs((prev) => [...prev, payload.message ?? ""]);
+            } else if (payload.type === "result") {
+              if (!payload.ok) {
+                const assistantMsg: ChatMessage = {
+                  id: crypto.randomUUID(),
+                  role: "assistant",
+                  content: `오류: ${payload.error || "알 수 없는 오류가 발생했습니다."}`,
+                };
+                lastAssistantIdRef.current = assistantMsg.id;
+                setMessages((prev) => [...prev, assistantMsg]);
+                setContexts([]);
+              } else {
+                const assistantMsg: ChatMessage = {
+                  id: crypto.randomUUID(),
+                  role: "assistant",
+                  content: (payload.answer || "").trim(),
+                };
+                lastAssistantIdRef.current = assistantMsg.id;
+                setMessages((prev) => [...prev, assistantMsg]);
+                setContexts(payload.contexts || []);
+              }
+            } else if (payload.type === "error") {
+              const assistantMsg: ChatMessage = {
+                id: crypto.randomUUID(),
+                role: "assistant",
+                content: `오류: ${payload.error || "알 수 없는 오류가 발생했습니다."}`,
+              };
+              lastAssistantIdRef.current = assistantMsg.id;
+              setMessages((prev) => [...prev, assistantMsg]);
+              setContexts([]);
+            }
+          } catch {
+            // ignore
+          }
+        }
+      }
     } catch (e) {
       const assistantMsg: ChatMessage = {
         id: crypto.randomUUID(),
@@ -348,6 +442,18 @@ export default function ChatPage() {
               <p className="mt-3 text-xs text-zinc-500">
                 팁: `/ingest`에서 문서를 먼저 인입하면 source 기준 검색이 가능합니다.
               </p>
+              {askLogs.length > 0 ? (
+                <div className="mt-3">
+                  <p className="mb-1 text-xs font-medium text-zinc-600 dark:text-zinc-400">
+                    채팅 실시간 로그 (SSE)
+                  </p>
+                  <pre className="max-h-40 overflow-y-auto rounded-xl border border-zinc-200 bg-zinc-100 p-3 text-xs text-zinc-800 dark:border-zinc-800 dark:bg-zinc-900 dark:text-zinc-200">
+                    {askLogs.map((line, i) => (
+                      <div key={i}>{line}</div>
+                    ))}
+                  </pre>
+                </div>
+              ) : null}
               {modelsError ? (
                 <p className="mt-2 text-xs text-red-600 dark:text-red-400">
                   모델 목록 오류: {modelsError}

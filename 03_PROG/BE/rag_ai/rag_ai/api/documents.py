@@ -63,6 +63,8 @@ class CleanupTextRequest(BaseModel):
     cleanup_model: str = Field("", description="정제용 모델명 override")
     # 사용자가 지정하는 청크 구분 기호 (기본: ###)
     cleanup_delimiter: str = Field("###", description="정제 가이드용 청크 구분 기호")
+    # Gemini cleanup 시 원문을 txt 첨부파일로 전송할지 여부
+    cleanup_send_as_file: bool = Field(False, description="Gemini Files API 첨부 사용 여부")
 
 
 class ChunkTextRequest(BaseModel):
@@ -366,6 +368,7 @@ async def cleanup_text(req: CleanupTextRequest) -> dict:
             raw_text=raw_text,
             provider=provider,
             model_override=model or None,
+            gemini_use_file=req.cleanup_send_as_file if provider == "gemini" else None,
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"텍스트 정제 실패: {e!s}")
@@ -384,6 +387,141 @@ async def cleanup_text(req: CleanupTextRequest) -> dict:
         "text": cleaned,
         "text_len": len(cleaned),
     }
+
+
+@router.post("/cleanup-text-stream")
+async def cleanup_text_stream(req: CleanupTextRequest):
+    """
+    3단계용 SSE API: 텍스트 정제를 수행하면서 진행 로그를 실시간 스트리밍합니다.
+    이벤트: type=log (message) / type=result (ok, text, text_len) / type=error (error)
+    """
+    raw_text = (req.text or "").strip()
+    if not raw_text:
+        raise HTTPException(status_code=400, detail="text가 비어 있습니다.")
+
+    provider = (req.cleanup_provider or settings.cleanup_provider or settings.llm_provider).strip().lower()
+    model = req.cleanup_model.strip() or ""
+    delimiter = (req.cleanup_delimiter or "###").strip() or "###"
+
+    log_queue: Queue = Queue()
+    cleanup_logger = logging.getLogger("rag_ai.services.text_cleanup")
+    handler = _QueueLogHandler(log_queue)
+    handler.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(name)s | %(message)s"))
+    cleanup_logger.addHandler(handler)
+    cleanup_logger.setLevel(logging.INFO)
+
+    log_queue.put(
+        (
+            "LOG",
+            f"{time.strftime('%Y-%m-%d %H:%M:%S')} | INFO | rag_ai.api.documents | [cleanup-text-stream] 시작. provider={provider}, model={model or '-'}, text_len={len(raw_text)}, send_as_file={req.cleanup_send_as_file}",
+        )
+    )
+
+    result_holder: list[tuple[str, dict | None]] = []
+
+    def run_cleanup() -> None:
+        try:
+            if not req.use_cleanup:
+                prefixed_text = (
+                    "다음은 pdf의 글자만 추출한 내용입니다. 의미없는 데이터가 많지요.\n"
+                    "500~1000자 정도의 의미 있는 청크로 분할하여, 마크다운 형식의 텍스트로 출력해 주세요.\n"
+                    "주석(루비)는 생략하고 본문만 추출해 주세요. 원문은 생략하지 말고 그대로 출력해 주세요.\n"
+                    "결과는 아티팩트(artifact)로 출력해 주세요.\n"
+                    f"구분 기호는 {delimiter}로 지정하고, 청크의 헤더에 짧은 요약문을 포함해 주세요.\n\n"
+                    f"{raw_text}"
+                )
+                result_holder.append(
+                    (
+                        "RESULT",
+                        {
+                            "cleanup_used": False,
+                            "provider": "",
+                            "model": "",
+                            "text": prefixed_text,
+                            "text_len": len(prefixed_text),
+                        },
+                    )
+                )
+                return
+
+            cleaned = preprocess_text_with_llm(
+                raw_text=raw_text,
+                provider=provider,
+                model_override=model or None,
+                gemini_use_file=req.cleanup_send_as_file if provider == "gemini" else None,
+            )
+            result_holder.append(
+                (
+                    "RESULT",
+                    {
+                        "cleanup_used": True,
+                        "provider": provider,
+                        "model": model,
+                        "text": cleaned,
+                        "text_len": len(cleaned),
+                    },
+                )
+            )
+        except Exception as e:
+            result_holder.append(("ERROR", {"error": str(e)}))
+        finally:
+            cleanup_logger.removeHandler(handler)
+            log_queue.put(_LOG_QUEUE_SENTINEL)
+
+    thread = threading.Thread(target=run_cleanup)
+    thread.start()
+
+    def _queue_get_no_block():
+        try:
+            return log_queue.get(timeout=0.25)
+        except Empty:
+            return None
+
+    _heartbeat_interval = 15.0
+
+    async def event_stream():
+        loop = asyncio.get_event_loop()
+        last_heartbeat = time.monotonic()
+        try:
+            while True:
+                item = await loop.run_in_executor(None, _queue_get_no_block)
+                if item is None:
+                    now = time.monotonic()
+                    if now - last_heartbeat >= _heartbeat_interval:
+                        yield ": heartbeat\n\n"
+                        last_heartbeat = now
+                    await asyncio.sleep(0.05)
+                    continue
+
+                if item == _LOG_QUEUE_SENTINEL:
+                    if result_holder:
+                        kind, value = result_holder[0]
+                        if kind == "RESULT" and value is not None:
+                            payload = {"type": "result", "ok": True, **value}
+                        else:
+                            payload = {
+                                "type": "error",
+                                "ok": False,
+                                "error": (value or {}).get("error", "알 수 없는 오류"),
+                            }
+                        yield f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+                    break
+
+                if item[0] == "LOG":
+                    last_heartbeat = time.monotonic()
+                    yield f"data: {json.dumps({'type': 'log', 'message': item[1]}, ensure_ascii=False)}\n\n"
+        finally:
+            thread.join(timeout=2.0)
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 @router.post("/chunk-text")

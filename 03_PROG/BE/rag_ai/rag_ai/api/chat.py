@@ -2,8 +2,14 @@
 # 최소 RAG API: 질문을 받으면 Qdrant 검색 + LLM 답변 생성까지 수행합니다.
 
 import logging
+import asyncio
+import json
+import threading
+import time
+from queue import Empty, Queue
 
 from fastapi import APIRouter, Query
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 from rag_ai.services.rag_service import answer_with_rag, list_available_models
@@ -90,6 +96,94 @@ async def chat_ask(req: ChatAskRequest) -> dict:
         result.get("used_embedding_provider", ""),
     )
     return result
+
+
+@router.post("/ask-stream")
+async def chat_ask_stream(req: ChatAskRequest):
+    """
+    RAG 채팅을 SSE(Server-Sent Events)로 스트리밍합니다.
+    이벤트: type=log (message) / type=result (answer, contexts, ...) / type=error (error)
+    """
+    log_queue: Queue = Queue()
+    result_holder: list[tuple[str, dict | str]] = []
+    sentinel = ("_END_", None)
+
+    def push_log(message: str) -> None:
+        now = time.strftime("%Y-%m-%d %H:%M:%S")
+        logger.info("%s", message)
+        log_queue.put(("LOG", f"{now} | INFO | rag_ai.api.chat | {message}"))
+
+    push_log(
+        f"[ask-stream] 시작. question_len={len(req.question or '')}, top_k={req.top_k}, source={req.source or '-'}, llm_provider={req.llm_provider or '-'}, embedding_provider={req.embedding_provider or '-'}"
+    )
+
+    def run_ask() -> None:
+        try:
+            result = answer_with_rag(
+                question=req.question,
+                top_k=req.top_k,
+                source=req.source.strip() or None,
+                llm_provider_override=req.llm_provider.strip() or None,
+                embedding_provider_override=req.embedding_provider.strip() or None,
+                llm_model_override=req.llm_model.strip() or None,
+                progress_callback=push_log,
+            )
+            result_holder.append(("RESULT", result))
+        except Exception as e:
+            result_holder.append(("ERROR", str(e)))
+        finally:
+            log_queue.put(sentinel)
+
+    thread = threading.Thread(target=run_ask)
+    thread.start()
+
+    def _queue_get_no_block():
+        try:
+            return log_queue.get(timeout=0.25)
+        except Empty:
+            return None
+
+    heartbeat_interval = 15.0
+
+    async def event_stream():
+        loop = asyncio.get_event_loop()
+        last_heartbeat = time.monotonic()
+        try:
+            while True:
+                item = await loop.run_in_executor(None, _queue_get_no_block)
+                if item is None:
+                    now = time.monotonic()
+                    if now - last_heartbeat >= heartbeat_interval:
+                        yield ": heartbeat\n\n"
+                        last_heartbeat = now
+                    await asyncio.sleep(0.05)
+                    continue
+
+                if item == sentinel:
+                    if result_holder:
+                        kind, value = result_holder[0]
+                        if kind == "RESULT":
+                            payload = {"type": "result", **value}
+                        else:
+                            payload = {"type": "error", "ok": False, "error": str(value)}
+                        yield f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+                    break
+
+                if item[0] == "LOG":
+                    last_heartbeat = time.monotonic()
+                    yield f"data: {json.dumps({'type': 'log', 'message': item[1]}, ensure_ascii=False)}\n\n"
+        finally:
+            thread.join(timeout=2.0)
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 @router.get("/models")

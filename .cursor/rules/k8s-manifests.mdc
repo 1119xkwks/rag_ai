@@ -51,3 +51,11 @@ alwaysApply: false
 - 이미지 교체나 환경변수 변경 후 재배포가 필요할 때는:
   - 위 주석에 적힌 `kubectl rollout ...` 커맨드를 그대로 따라 수행하면 된다.
 
+## 4. PV/PVC는 항상 분리 파일로 관리
+
+- `PersistentVolume(PV)`와 `PersistentVolumeClaim(PVC)`는 **항상 각각 별도 yaml 파일**로 작성한다.
+- Deployment/Service와 같은 워크로드 리소스 파일에 PV/PVC를 섞어 넣지 않는다.
+- 권장 파일명:
+  - `<app>-pv.yaml` (PV)
+  - `<app>-pvc.yaml` (PVC)
+
