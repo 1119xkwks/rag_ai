@@ -3,6 +3,7 @@
 # "### 헤더 + 본문" 형태의 마크다운으로 바꾸는 서비스입니다.
 # Gemini일 때 원문이 길면 Files API로 첨부해 요청합니다.
 
+import json
 from typing import Any
 
 import httpx
@@ -19,6 +20,22 @@ _GEMINI_FILES_BASE = "https://generativelanguage.googleapis.com/v1beta"
 _GEMINI_MAX_RETRIES = 5
 _GEMINI_BACKOFF_BASE_SEC = 2.0
 _GEMINI_BACKOFF_MAX_SEC = 30.0
+
+
+def _emit_llm_request_logs(
+    prefix: str,
+    *,
+    url: str,
+    payload: dict[str, Any],
+    chunk_size: int = 2000,
+) -> None:
+    """LLM 요청 URL/payload를 backend logger와 SSE 로그에 남깁니다."""
+    payload_json = json.dumps(payload, ensure_ascii=False)
+    logger.info("%s request_url=%s", prefix, url)
+    logger.info("%s payload_len=%s", prefix, len(payload_json))
+    for i, start in enumerate(range(0, len(payload_json), chunk_size), start=1):
+        chunk = payload_json[start : start + chunk_size]
+        logger.info("%s payload_chunk[%s]=%s", prefix, i, chunk)
 
 
 def _default_model_for_provider(provider: str) -> str:
@@ -44,7 +61,7 @@ def _build_cleanup_prompt(raw_text: str) -> str:
         "루비(주석)는 생략하고 본문만 추출해 주세요.\n"
         "원문 내용은 생략하지 말고 최대한 보존해 주세요.\n"
         "각 청크는 반드시 '### '로 시작하는 짧은 요약 헤더를 포함해 주세요.\n"
-        "출력은 순수 마크다운 텍스트만 출력해 주세요.\n\n"
+        "출력은 순수 마크다운 텍스트만 출력해 주세요. '알겠습니다', '이해했습니다' 등의 인사말이나 지시사항 복창(예: We need to output markdown text...), 너의 계획이나 추론 과정은 일절 포함하지 마세요. 반드시 첫 번째 청크의 '### ' 헤더로 바로 응답을 시작해야 합니다.\n\n"
         "=== 원문 시작 ===\n"
         f"{raw_text}\n"
         "=== 원문 끝 ===\n"
@@ -59,7 +76,7 @@ def _build_cleanup_prompt_file_instruction_only() -> str:
         "루비(주석)는 생략하고 본문만 추출해 주세요.\n"
         "원문 내용은 생략하지 말고 최대한 보존해 주세요.\n"
         "각 청크는 반드시 '### '로 시작하는 짧은 요약 헤더를 포함해 주세요.\n"
-        "출력은 순수 마크다운 텍스트만 출력해 주세요."
+        "출력은 순수 마크다운 텍스트만 출력해 주세요. '알겠습니다', '이해했습니다' 등의 인사말이나 지시사항 복창(예: We need to output markdown text...), 너의 계획이나 추론 과정은 일절 포함하지 마세요. 반드시 첫 번째 청크의 '### ' 헤더로 바로 응답을 시작해야 합니다."
     )
 
 
@@ -200,21 +217,27 @@ def _gemini_generate_with_retry(
 
 def _strip_vllm_think_prefix(text: str) -> str:
     """
-    vLLM 응답에 '</think>'가 포함되고 그 뒤에 실제 본문이 있으면,
-    '</think>'까지 제거하고 뒤 텍스트만 반환합니다.
+    vLLM 등 모델의 응답에서 '</think>' 블록이나 인사말, 복창 부분을 제거합니다.
     """
+    import re
+    # 1. <think> ... </think> 블록 제거
+    text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
+
+    # 2. 닫는 태그만 남아있을 경우 제거
     marker = "</think>"
-    if marker not in text:
-        return text
-    head, tail = text.split(marker, 1)
-    if not tail.strip():
-        return text
-    logger.debug(
-        "[CLEANUP_LLM] provider=vllm think-prefix 제거 적용 before_len=%s after_len=%s",
-        len(text),
-        len(tail.strip()),
-    )
-    return tail.strip()
+    if marker in text:
+        head, tail = text.split(marker, 1)
+        text = tail if tail.strip() else text
+
+    # 3. 모델이 인사말이나 지시사항 복창("We need to output...")을 먼저 한 뒤 ### 로 시작하는 경우, 첫 ### 이전의 텍스트 제거
+    text_stripped = text.strip()
+    # ### 로 시작하지 않고, 텍스트 중간에 ### 가 있는 경우, 불필요한 서론일 가능성이 높음
+    if not text_stripped.startswith("###") and "###" in text_stripped:
+        parts = text_stripped.split("###", 1)
+        # 서론 부분(parts[0])이 영문 복창이나 단순 안내문(예: Here is the result)일 수 있으므로 제거
+        return "###" + parts[1]
+
+    return text_stripped
 
 
 def preprocess_text_with_llm(
@@ -242,7 +265,10 @@ def preprocess_text_with_llm(
     model_name = (model_override or _default_model_for_provider(p)).strip()
     prompt = _build_cleanup_prompt(raw_text)
     system_text = (
-        "너는 문서 정제 도우미다. 손상된 PDF 추출 텍스트를 가독성 높은 구조로 정리한다."
+        "너는 문서 정제 도우미다. 손상된 PDF 추출 텍스트를 가독성 높은 구조로 정리한다.\n"
+        "500~1000자 정도의 의미 있는 청크로 분할하여, 마크다운 형식의 텍스트로 출력해 주세요.\n"
+        "주석(루비)는 생략하고 본문만 추출해 주세요. 원문은 생략하지 말고 그대로 출력해 주세요.\n"
+        "결과는 아티팩트(artifact)로 출력해 주세요. 의미없는 공백이나 빈칸 표는 제거해주세요."
     )
 
     if p == "gemini":
@@ -275,12 +301,28 @@ def preprocess_text_with_llm(
             user_parts = [{"text": prompt}]
 
         url = f"{_GEMINI_FILES_BASE}/models/{model_name}:generateContent"
+        request_payload = {
+            "system_instruction": {"parts": [{"text": system_text}]},
+            "contents": [{"role": "user", "parts": user_parts}],
+            "generationConfig": {
+                "temperature": 0.0,
+                "maxOutputTokens": max(
+                    256,
+                    int(getattr(settings, "gemini_cleanup_max_output_tokens", 4096)),
+                ),
+            },
+        }
         t = time.perf_counter()
         logger.debug(
             "[CLEANUP_LLM_START] provider=gemini model=%s use_file=%s raw_text_len=%s",
             model_name,
             use_file,
             len(raw_text),
+        )
+        _emit_llm_request_logs(
+            f"[CLEANUP_LLM_REQUEST] provider=gemini model={model_name}",
+            url=url,
+            payload=request_payload,
         )
         timeout = httpx.Timeout(
             connect=min(settings.gemini_timeout_sec, 30.0),
@@ -295,24 +337,11 @@ def preprocess_text_with_llm(
                     client=client,
                     url=url,
                     params={"key": settings.gemini_api_key},
-                    payload={
-                        "system_instruction": {"parts": [{"text": system_text}]},
-                        "contents": [{"role": "user", "parts": user_parts}],
-                    "generationConfig": {
-                        "temperature": 0.0,
-                        "maxOutputTokens": max(
-                            256,
-                            int(getattr(settings, "gemini_cleanup_max_output_tokens", 4096)),
-                        ),
-                    },
-                    },
+                    payload=request_payload,
                 )
         except httpx.HTTPStatusError as e:
             if e.response is not None and e.response.status_code == 429:
-                raise ValueError(
-                    "Gemini rate limit(429)에 걸렸습니다. 잠시 후 다시 시도하거나, "
-                    "다른 cleanup provider(OpenAI/vLLM)로 실행해 주세요."
-                ) from e
+                raise ValueError(e.response.text) from e
             raise
 
         candidates = data.get("candidates", [])
@@ -348,11 +377,25 @@ def preprocess_text_with_llm(
 
     if p == "vllm":
         t = time.perf_counter()
+        request_url = f"{settings.vllm_api_url.rstrip('/')}/chat/completions"
+        request_payload = {
+            "model": model_name,
+            "messages": [
+                {"role": "system", "content": system_text},
+                {"role": "user", "content": prompt},
+            ],
+            "temperature": 0.0,
+        }
         logger.debug(
             "[CLEANUP_LLM_START] provider=vllm model=%s full_url=%s raw_text_len=%s",
             model_name,
-            f"{settings.vllm_api_url.rstrip('/')}/chat/completions",
+            request_url,
             len(raw_text),
+        )
+        _emit_llm_request_logs(
+            f"[CLEANUP_LLM_REQUEST] provider=vllm model={model_name}",
+            url=request_url,
+            payload=request_payload,
         )
         client = OpenAI(
             base_url=settings.vllm_api_url,
@@ -363,25 +406,32 @@ def preprocess_text_with_llm(
         if not settings.openai_api_key:
             raise ValueError("OPENAI_API_KEY가 설정되어 있지 않습니다.")
         t = time.perf_counter()
+        request_url = "https://api.openai.com/v1/chat/completions"
+        request_payload = {
+            "model": model_name,
+            "messages": [
+                {"role": "system", "content": system_text},
+                {"role": "user", "content": prompt},
+            ],
+            "temperature": 0.0,
+        }
         logger.debug(
             "[CLEANUP_LLM_START] provider=openai model=%s full_url=%s raw_text_len=%s",
             model_name,
-            "https://api.openai.com/v1/chat/completions",
+            request_url,
             len(raw_text),
+        )
+        _emit_llm_request_logs(
+            f"[CLEANUP_LLM_REQUEST] provider=openai model={model_name}",
+            url=request_url,
+            payload=request_payload,
         )
         client = OpenAI(
             api_key=settings.openai_api_key or None,
             timeout=settings.openai_timeout_sec,
         )
 
-    completion = client.chat.completions.create(
-        model=model_name,
-        messages=[
-            {"role": "system", "content": system_text},
-            {"role": "user", "content": prompt},
-        ],
-        temperature=0.0,
-    )
+    completion = client.chat.completions.create(**request_payload)
     text = (completion.choices[0].message.content or "").strip()
     if p == "vllm":
         text = _strip_vllm_think_prefix(text)
