@@ -147,13 +147,20 @@ def _extract_text_from_qwen_output(raw_output: Any) -> str:
                 walk(item)
             return
         if isinstance(value, dict):
+            # chat 템플릿 구조(role/content)면 assistant 내용만 수집
+            role = value.get("role")
+            if role == "assistant":
+                walk(value.get("content"))
+                return
+            if role == "user":
+                return
+
             # 자주 나오는 키를 우선 탐색
             for key in ("generated_text", "text", "content", "message"):
                 if key in value:
                     walk(value[key])
-            # 나머지 값도 훑어서 누락을 줄임
-            for v in value.values():
-                walk(v)
+            # 입력 프롬프트가 섞이는 것을 방지하기 위해
+            # dict 전체 values 재귀 순회는 하지 않습니다.
 
     walk(raw_output)
 

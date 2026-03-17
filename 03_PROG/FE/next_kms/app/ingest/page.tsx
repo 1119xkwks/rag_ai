@@ -343,6 +343,10 @@ export default function IngestPage() {
                 `3단계 완료: ${payload.cleanup_used ? "LLM 정제 적용" : "정제 생략"} / ${payload.text_len || 0}자`,
               );
             } else if (payload.type === "error" || (payload.type === "result" && !payload.ok)) {
+              setCleanupLogs((prev) => [
+                ...prev,
+                `[ERROR] ${payload.error || "알 수 없는 오류"}`,
+              ]);
               setStatusMsg(`3단계 실패: ${payload.error || "알 수 없는 오류"}`);
             }
           } catch {
@@ -373,6 +377,10 @@ export default function IngestPage() {
                 `3단계 완료: ${payload.cleanup_used ? "LLM 정제 적용" : "정제 생략"} / ${payload.text_len || 0}자`,
               );
             } else if (payload.type === "error" || (payload.type === "result" && !payload.ok)) {
+              setCleanupLogs((prev) => [
+                ...prev,
+                `[ERROR] ${payload.error || "알 수 없는 오류"}`,
+              ]);
               setStatusMsg(`3단계 실패: ${payload.error || "알 수 없는 오류"}`);
             }
           } catch {
