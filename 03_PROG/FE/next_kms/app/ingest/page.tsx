@@ -5,6 +5,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 
 type Provider = "openai" | "vllm" | "gemini";
 type PdfExtractMethod = "pypdf" | "vision_qwen";
+type ExtractPagePreview = { page: number; text: string };
 
 type ChatModelsResponse = {
   ok: boolean;
@@ -43,7 +44,10 @@ export default function IngestPage() {
 
   const [extractLoading, setExtractLoading] = useState(false);
   const [extractMethod, setExtractMethod] = useState<PdfExtractMethod>("pypdf");
+  const [extractPagesInput, setExtractPagesInput] = useState("");
   const [extractLogs, setExtractLogs] = useState<string[]>([]);
+  const [extractPageTexts, setExtractPageTexts] = useState<ExtractPagePreview[]>([]);
+  const [extractTotalPages, setExtractTotalPages] = useState(0);
   const [rawText, setRawText] = useState("");
 
   const [useCleanup, setUseCleanup] = useState(true);
@@ -145,10 +149,14 @@ export default function IngestPage() {
     setExtractLoading(true);
     setStatusMsg("");
     setExtractLogs([]);
+    setExtractPageTexts([]);
+    setExtractTotalPages(0);
     try {
       const form = new FormData();
       form.set("file", pdfFile);
       form.set("extract_method", extractMethod);
+      const pagesInput = extractPagesInput.trim();
+      if (pagesInput) form.set("extract_pages", pagesInput);
       const res = await fetch("/api/documents/extract-text-stream", {
         method: "POST",
         body: form,
@@ -178,10 +186,29 @@ export default function IngestPage() {
               ok?: boolean;
               text?: string;
               text_len?: number;
+              page_index?: number;
+              total_pages?: number;
               error?: string;
             };
             if (payload.type === "log" && payload.message != null) {
               setExtractLogs((prev) => [...prev, payload.message ?? ""]);
+            } else if (payload.type === "page") {
+              const pageIndex = payload.page_index ?? 0;
+              const totalPages = payload.total_pages ?? 0;
+              if (totalPages > 0) setExtractTotalPages(totalPages);
+              if (pageIndex > 0) {
+                setExtractPageTexts((prev) => {
+                  const next = [...prev];
+                  const idx = next.findIndex((x) => x.page === pageIndex);
+                  if (idx >= 0) {
+                    next[idx] = { page: pageIndex, text: payload.text ?? "" };
+                  } else {
+                    next.push({ page: pageIndex, text: payload.text ?? "" });
+                    next.sort((a, b) => a.page - b.page);
+                  }
+                  return next;
+                });
+              }
             } else if (payload.type === "result" && payload.ok) {
               setRawText(payload.text ?? "");
               setCleanedText("");
@@ -210,10 +237,29 @@ export default function IngestPage() {
               ok?: boolean;
               text?: string;
               text_len?: number;
+              page_index?: number;
+              total_pages?: number;
               error?: string;
             };
             if (payload.type === "log" && payload.message != null) {
               setExtractLogs((prev) => [...prev, payload.message ?? ""]);
+            } else if (payload.type === "page") {
+              const pageIndex = payload.page_index ?? 0;
+              const totalPages = payload.total_pages ?? 0;
+              if (totalPages > 0) setExtractTotalPages(totalPages);
+              if (pageIndex > 0) {
+                setExtractPageTexts((prev) => {
+                  const next = [...prev];
+                  const idx = next.findIndex((x) => x.page === pageIndex);
+                  if (idx >= 0) {
+                    next[idx] = { page: pageIndex, text: payload.text ?? "" };
+                  } else {
+                    next.push({ page: pageIndex, text: payload.text ?? "" });
+                    next.sort((a, b) => a.page - b.page);
+                  }
+                  return next;
+                });
+              }
             } else if (payload.type === "result" && payload.ok) {
               setRawText(payload.text ?? "");
               setCleanedText("");
@@ -401,6 +447,8 @@ export default function IngestPage() {
     setChunks([]);
     setChunkMode("");
     setExtractLogs([]);
+    setExtractPageTexts([]);
+    setExtractTotalPages(0);
     setStatusMsg("초기화 완료");
   }
 
@@ -462,6 +510,20 @@ export default function IngestPage() {
                 <option value="vision_qwen">vision_qwen (Qwen-VL, 이미지 OCR)</option>
               </select>
             </label>
+            <label className="flex flex-col gap-1 md:col-span-2">
+              <span className="text-xs font-medium text-zinc-600 dark:text-zinc-400">
+                추출 페이지 (비우면 전체)
+              </span>
+              <input
+                value={extractPagesInput}
+                onChange={(e) => setExtractPagesInput(e.target.value)}
+                placeholder="예: 1, 2, 1-5, 7-9, 15"
+                className="h-10 rounded-xl border border-zinc-200 bg-white px-3 text-sm outline-none focus:border-zinc-400 dark:border-zinc-800 dark:bg-zinc-950 dark:focus:border-zinc-600"
+              />
+              <span className="text-[11px] text-zinc-500 dark:text-zinc-400">
+                비우면 전체, 값이 있으면 단일/CSV/범위(1-5) 자동 인식
+              </span>
+            </label>
           </div>
           <div className="mt-3 flex items-center gap-2">
             <button
@@ -496,6 +558,32 @@ export default function IngestPage() {
                   <div key={i}>{line}</div>
                 ))}
               </pre>
+            </div>
+          ) : null}
+          {extractMethod === "vision_qwen" && extractPageTexts.length > 0 ? (
+            <div className="mt-3">
+              <p className="mb-1 text-xs font-medium text-zinc-600 dark:text-zinc-400">
+                페이지별 실시간 결과 ({extractPageTexts.filter((t) => !!t.text?.trim()).length}/
+                {extractTotalPages || extractPageTexts.length})
+              </p>
+              <div className="grid grid-cols-1 gap-3 md:grid-cols-3">
+                {extractPageTexts.map((item, i) => (
+                  <div key={item.page} className="rounded-xl border border-zinc-200 p-2 dark:border-zinc-800">
+                    <div className="mb-1 text-[11px] text-zinc-500">page #{item.page}</div>
+                    <textarea
+                      value={item.text || ""}
+                      onChange={(e) =>
+                        setExtractPageTexts((prev) => {
+                          const next = [...prev];
+                          next[i] = { ...next[i], text: e.target.value };
+                          return next;
+                        })
+                      }
+                      className="min-h-[140px] w-full rounded-lg border border-zinc-200 bg-white p-2 text-xs outline-none focus:border-zinc-400 dark:border-zinc-800 dark:bg-zinc-950 dark:focus:border-zinc-600"
+                    />
+                  </div>
+                ))}
+              </div>
             </div>
           ) : null}
         </section>

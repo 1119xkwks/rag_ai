@@ -10,6 +10,7 @@ import io
 import logging
 from pathlib import Path
 import threading
+from collections.abc import Callable
 from typing import Any, List
 
 from pypdf import PdfReader
@@ -34,11 +35,31 @@ def _normalize_extract_method(extract_method: str | None) -> str:
     return method
 
 
-def _extract_text_with_pypdf_from_bytes(data: bytes) -> str:
+def _extract_text_with_pypdf_from_bytes(
+    data: bytes,
+    selected_pages: list[int] | None = None,
+) -> str:
     stream = io.BytesIO(data)
     reader = PdfReader(stream)
+    total_pages = len(reader.pages)
+    target_pages: list[int]
+    if selected_pages:
+        seen = set()
+        target_pages = []
+        for p in selected_pages:
+            if p < 1 or p > total_pages:
+                raise ValueError(
+                    f"선택한 페이지 번호가 범위를 벗어났습니다: {p} (총 {total_pages}페이지)"
+                )
+            if p not in seen:
+                seen.add(p)
+                target_pages.append(p)
+    else:
+        target_pages = list(range(1, total_pages + 1))
+
     parts: List[str] = []
-    for page in reader.pages:
+    for page_no in target_pages:
+        page = reader.pages[page_no - 1]
         text = page.extract_text()
         if text:
             parts.append(text)
@@ -149,6 +170,8 @@ def _extract_text_from_qwen_output(raw_output: Any) -> str:
 def _extract_text_with_qwen_vision(
     data: bytes,
     cancelled: threading.Event | None = None,
+    on_page_complete: Callable[[int, int, str], None] | None = None,
+    selected_pages: list[int] | None = None,
 ) -> str:
     """
     vision_qwen 동작 순서:
@@ -165,7 +188,41 @@ def _extract_text_with_qwen_vision(
     dpi = settings.qwen_vl_dpi
     max_new_tokens = settings.qwen_vl_max_new_tokens
 
-    images = _render_pdf_pages_as_images(data=data, dpi=dpi, max_pages=max_pages)
+    try:
+        import pypdfium2 as pdfium
+    except Exception as e:
+        raise RuntimeError(
+            "vision_qwen 사용을 위해 pypdfium2가 필요합니다. 예: pip install pypdfium2"
+        ) from e
+
+    pdf = pdfium.PdfDocument(data)
+    total_pdf_pages = len(pdf)
+    if total_pdf_pages <= 0:
+        return ""
+
+    if selected_pages:
+        # 1-based 페이지 번호를 받아 유효한 범위만 허용
+        seen = set()
+        target_pages = []
+        for p in selected_pages:
+            if p < 1 or p > total_pdf_pages:
+                raise ValueError(
+                    f"선택한 페이지 번호가 범위를 벗어났습니다: {p} (총 {total_pdf_pages}페이지)"
+                )
+            if p not in seen:
+                seen.add(p)
+                target_pages.append(p)
+    else:
+        page_limit = total_pdf_pages if max_pages <= 0 else min(total_pdf_pages, max_pages)
+        target_pages = list(range(1, page_limit + 1))
+
+    images: list[tuple[int, Any]] = []
+    scale = max(dpi, 72) / 72.0
+    for page_no in target_pages:
+        page = pdf[page_no - 1]
+        bitmap = page.render(scale=scale)
+        images.append((page_no, bitmap.to_pil()))
+
     if not images:
         return ""
 
@@ -174,8 +231,9 @@ def _extract_text_with_qwen_vision(
 
     total = len(images)
     logger.info(
-        "[vision_qwen] PDF → 이미지 변환 완료. 총 %s페이지. 이제 Qwen-VL로 페이지별 텍스트 추출을 시작합니다.",
+        "[vision_qwen] PDF → 이미지 변환 완료. 처리 대상 %s페이지 (원본 총 %s페이지). 이제 Qwen-VL로 페이지별 텍스트 추출을 시작합니다.",
         total,
+        total_pdf_pages,
     )
 
     pipe = _get_qwen_vl_pipeline(model_id)
@@ -189,12 +247,13 @@ def _extract_text_with_qwen_vision(
         "출력은 한국어 설명과 원문 텍스트를 함께, 읽기 순서를 유지해서 plain text로 출력하세요."
     )
 
-    for page_idx, image in enumerate(images, start=1):
+    for seq_idx, (page_no, image) in enumerate(images, start=1):
         if cancelled and cancelled.is_set():
             raise ExtractionCancelled()
         logger.info(
-            "[vision_qwen] PDF 페이지 %s/%s Vision OCR 수행 중 (이미지→텍스트, 페이지당 수 분 걸릴 수 있음)",
-            page_idx,
+            "[vision_qwen] PDF 페이지 %s 처리 중 (%s/%s, 이미지→텍스트, 페이지당 수 분 걸릴 수 있음)",
+            page_no,
+            seq_idx,
             total,
         )
         messages = [
@@ -208,13 +267,19 @@ def _extract_text_with_qwen_vision(
         ]
         output = pipe(text=messages, max_new_tokens=max_new_tokens)
         extracted = _extract_text_from_qwen_output(output)
-        page_texts.append(f"[PAGE {page_idx}]\n{extracted}".strip())
+        page_texts.append(f"[PAGE {page_no}]\n{extracted}".strip())
         logger.info(
-            "[vision_qwen] PDF 페이지 %s/%s 완료. 추출 글자 수=%s",
-            page_idx,
+            "[vision_qwen] PDF 페이지 %s 완료 (%s/%s). 추출 글자 수=%s",
+            page_no,
+            seq_idx,
             total,
             len(extracted),
         )
+        if on_page_complete is not None:
+            try:
+                on_page_complete(page_no, total, extracted)
+            except Exception as e:
+                logger.warning("[vision_qwen] on_page_complete 콜백 실패: %s", e)
 
     return "\n\n".join([t for t in page_texts if t.strip()])
 
@@ -250,6 +315,8 @@ def load_text_from_pdf_bytes(
     data: bytes,
     extract_method: str = "pypdf",
     cancelled: threading.Event | None = None,
+    on_page_complete: Callable[[int, int, str], None] | None = None,
+    selected_pages: list[int] | None = None,
 ) -> str:
     """
     PDF 바이트 데이터(예: 업로드된 파일 내용)에서 텍스트를 추출합니다.
@@ -260,8 +327,13 @@ def load_text_from_pdf_bytes(
     method = _normalize_extract_method(extract_method)
     logger.debug("[PDF_EXTRACT_START] method=%s bytes=%s", method, len(data))
     if method == "pypdf":
-        text = _extract_text_with_pypdf_from_bytes(data)
+        text = _extract_text_with_pypdf_from_bytes(data, selected_pages=selected_pages)
     else:
-        text = _extract_text_with_qwen_vision(data, cancelled=cancelled)
+        text = _extract_text_with_qwen_vision(
+            data,
+            cancelled=cancelled,
+            on_page_complete=on_page_complete,
+            selected_pages=selected_pages,
+        )
     logger.debug("[PDF_EXTRACT_DONE] method=%s text_len=%s", method, len(text))
     return text

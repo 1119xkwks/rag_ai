@@ -52,6 +52,52 @@ def _normalize_extract_method(method: str) -> str:
     return normalized
 
 
+def _parse_extract_pages_csv(pages_csv: str) -> list[int]:
+    """
+    1-based 페이지 입력을 파싱합니다.
+    허용 예:
+    - "1"
+    - "1,3,5"
+    - "1-5, 7-9, 15"
+    """
+    raw = (pages_csv or "").strip()
+    if not raw:
+        return []
+    pages: list[int] = []
+    seen = set()
+    for token in raw.split(","):
+        t = token.strip()
+        if not t:
+            continue
+        if "-" in t:
+            start_raw, _, end_raw = t.partition("-")
+            start_str = start_raw.strip()
+            end_str = end_raw.strip()
+            if not start_str.isdigit() or not end_str.isdigit():
+                raise HTTPException(status_code=400, detail=f"페이지 범위 형식이 올바르지 않습니다: {t}")
+            start = int(start_str)
+            end = int(end_str)
+            if start <= 0 or end <= 0:
+                raise HTTPException(status_code=400, detail=f"페이지 번호는 1 이상이어야 합니다: {t}")
+            if start > end:
+                raise HTTPException(status_code=400, detail=f"페이지 범위 시작이 끝보다 클 수 없습니다: {t}")
+            for page_no in range(start, end + 1):
+                if page_no not in seen:
+                    seen.add(page_no)
+                    pages.append(page_no)
+            continue
+
+        if not t.isdigit():
+            raise HTTPException(status_code=400, detail=f"페이지 번호 형식이 올바르지 않습니다: {t}")
+        page_no = int(t)
+        if page_no <= 0:
+            raise HTTPException(status_code=400, detail=f"페이지 번호는 1 이상이어야 합니다: {t}")
+        if page_no not in seen:
+            seen.add(page_no)
+            pages.append(page_no)
+    return pages
+
+
 class CleanupTextRequest(BaseModel):
     # 사용자가 수정한 원문 텍스트(또는 PDF 추출 텍스트)
     text: str = Field(..., description="정제할 원문 텍스트")
@@ -220,6 +266,10 @@ async def extract_text_from_pdf_stream(
         "",
         description="PDF 텍스트 추출 방식 (pypdf | vision_qwen), 비우면 서버 기본값",
     ),
+    extract_pages: str = Query(
+        "",
+        description="추출할 페이지 번호 CSV(1-based). 비우면 전체 페이지",
+    ),
 ):
     """
     PDF 텍스트 추출을 수행하면서 진행 로그를 SSE(Server-Sent Events)로 실시간 스트리밍합니다.
@@ -240,6 +290,7 @@ async def extract_text_from_pdf_stream(
         method = _normalize_extract_method(extract_method)
     except HTTPException:
         raise
+    selected_pages = _parse_extract_pages_csv(extract_pages)
 
     log_queue: Queue = Queue()
     pdf_logger = logging.getLogger("rag_ai.ingestion.pdf_loader")
@@ -249,15 +300,39 @@ async def extract_text_from_pdf_stream(
     pdf_logger.setLevel(logging.INFO)
 
     log_queue.put(
-        ("LOG", f"{time.strftime('%Y-%m-%d %H:%M:%S')} | INFO | rag_ai.api.documents | [extract-text-stream] 시작. method={method}, filename={file.filename}, size_bytes={len(pdf_bytes)}")
+        (
+            "LOG",
+            f"{time.strftime('%Y-%m-%d %H:%M:%S')} | INFO | rag_ai.api.documents | [extract-text-stream] 시작. method={method}, filename={file.filename}, size_bytes={len(pdf_bytes)}, pages={selected_pages or 'all'}",
+        )
     )
 
     cancelled = threading.Event()
     result_holder: list[tuple[str, str | None]] = []
 
+    def on_page_complete(page_idx: int, total_pages: int, page_text: str) -> None:
+        log_queue.put(
+            (
+                "PAGE",
+                {
+                    "type": "page",
+                    "ok": True,
+                    "page_index": page_idx,
+                    "total_pages": total_pages,
+                    "text": page_text,
+                    "text_len": len(page_text or ""),
+                },
+            )
+        )
+
     def run_extraction() -> None:
         try:
-            text = load_text_from_pdf_bytes(pdf_bytes, extract_method=method, cancelled=cancelled)
+            text = load_text_from_pdf_bytes(
+                pdf_bytes,
+                extract_method=method,
+                cancelled=cancelled,
+                on_page_complete=on_page_complete if method == "vision_qwen" else None,
+                selected_pages=selected_pages or None,
+            )
             result_holder.append(("RESULT", text))
         except ExtractionCancelled:
             result_holder.append(("CANCELLED", None))
@@ -310,6 +385,9 @@ async def extract_text_from_pdf_stream(
                 if item[0] == "LOG":
                     last_heartbeat = time.monotonic()
                     yield f"data: {json.dumps({'type': 'log', 'message': item[1]}, ensure_ascii=False)}\n\n"
+                if item[0] == "PAGE":
+                    last_heartbeat = time.monotonic()
+                    yield f"data: {json.dumps(item[1], ensure_ascii=False)}\n\n"
         except (GeneratorExit, BaseException):
             cancelled.set()
             raise

@@ -12,6 +12,7 @@ export async function POST(req: Request) {
   const form = await req.formData();
   const file = form.get("file");
   const extractMethod = String(form.get("extract_method") || "pypdf");
+  const extractPages = String(form.get("extract_pages") || "").trim();
 
   if (!(file instanceof File)) {
     return NextResponse.json(
@@ -23,7 +24,10 @@ export async function POST(req: Request) {
   const body = new FormData();
   body.set("file", file);
 
-  const backendUrl = `${getBackendBaseUrl()}/documents/extract-text-stream?extract_method=${encodeURIComponent(extractMethod)}`;
+  const params = new URLSearchParams();
+  params.set("extract_method", extractMethod);
+  if (extractPages) params.set("extract_pages", extractPages);
+  const backendUrl = `${getBackendBaseUrl()}/documents/extract-text-stream?${params.toString()}`;
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), EXTRACT_TEXT_TIMEOUT_MS);
 
