@@ -11,6 +11,8 @@ type ChatAskRequest = {
   llm_provider?: string;
   llm_model?: string;
   embedding_provider?: string;
+  use_vector_db?: boolean;
+  use_tools?: boolean;
 };
 
 function getBackendBaseUrl(): string {
@@ -41,13 +43,16 @@ export async function POST(req: Request) {
   }
 
   // 3) 백엔드로 그대로 전달할 페이로드를 구성합니다.
+  const useVectorDb = body.use_vector_db ?? false;
   const payload = {
     question,
-    top_k: body.top_k ?? 5,
-    source: (body.source || "").trim(),
+    top_k: useVectorDb ? (body.top_k ?? 5) : 5,
+    source: useVectorDb ? (body.source || "").trim() : "",
     llm_provider: (body.llm_provider || "").trim(),
     llm_model: (body.llm_model || "").trim(),
-    embedding_provider: (body.embedding_provider || "").trim(),
+    embedding_provider: useVectorDb ? (body.embedding_provider || "").trim() : "",
+    use_vector_db: useVectorDb,
+    use_tools: body.use_tools ?? true,
   };
 
   // 4) FastAPI 백엔드로 SSE 요청을 전달합니다.

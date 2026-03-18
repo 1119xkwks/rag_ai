@@ -7,6 +7,7 @@ from fastapi.responses import Response
 
 from rag_ai.api.chat import router as chat_router
 from rag_ai.api.documents import router as documents_router
+from rag_ai.api.tools import router as tools_router
 from rag_ai.config import settings
 
 # 전체 애플리케이션 로그 레벨을 환경 변수(settings.log_level)에 맞춰 설정합니다.
@@ -32,6 +33,9 @@ app.include_router(documents_router)
 
 # 채팅(RAG 질의) API (POST /chat/ask) 등록
 app.include_router(chat_router)
+
+# 도구 조회/실행 API 등록
+app.include_router(tools_router)
 
 
 @app.middleware("http")

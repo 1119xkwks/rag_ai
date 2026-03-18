@@ -11,6 +11,7 @@ from typing import Any, List
 import httpx
 import json
 import logging
+import re
 import time
 from openai import APIConnectionError
 from openai import APITimeoutError
@@ -19,6 +20,7 @@ from openai import OpenAI
 from rag_ai.config import settings
 from rag_ai.services.embedding_service import embed_single
 from rag_ai.services.vector_service import ensure_collection, get_qdrant_client, search_similar
+from rag_ai.tools import list_tool_specs, run_tool
 
 logger = logging.getLogger("rag_ai.services.rag")
 
@@ -45,6 +47,197 @@ def _llm_full_url(provider: str, model_name: str) -> str:
         return "https://api.openai.com/v1/chat/completions"
     # Gemini는 model별 endpoint를 사용합니다.
     return f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent"
+
+
+def _build_openai_tool_defs() -> list[dict[str, Any]]:
+    """
+    내부 Tool 스펙을 OpenAI-compatible tool schema로 변환합니다.
+    """
+    defs: list[dict[str, Any]] = []
+    for spec in list_tool_specs():
+        defs.append(
+            {
+                "type": "function",
+                "function": {
+                    "name": spec["name"],
+                    "description": spec["description"],
+                    "parameters": spec["input_schema"],
+                },
+            }
+        )
+    return defs
+
+
+def _extract_search_query_from_question(question: str) -> str:
+    """
+    사용자의 검색 요청 문장에서 실제 검색어를 추출합니다.
+    """
+    q = (question or "").strip()
+    if not q:
+        return ""
+    patterns = [
+        r"^\s*search\s*를\s*이용해서\s*",
+        r"^\s*search를\s*이용해서\s*",
+        r"^\s*검색해서\s*",
+        r"^\s*검색\s*해줘\s*",
+    ]
+    cleaned = q
+    for p in patterns:
+        cleaned = re.sub(p, "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(
+        r"\s*(알려줘|알려주세요|찾아줘|찾아주세요|설명해줘|설명해주세요)\s*[.!?…]*\s*$",
+        "",
+        cleaned,
+    ).strip()
+    return cleaned or q
+
+
+def _run_rule_based_tool_shortcuts(
+    *,
+    question: str,
+    progress: Callable[[str], None],
+) -> tuple[str | None, list[dict[str, Any]]]:
+    """
+    모델이 tool_call을 잘 못 내는 경우를 위해,
+    명시적인 요청 패턴에 대해 도구를 강제 실행하는 fallback.
+    """
+    q = (question or "").strip()
+    q_lower = q.lower()
+    used_tools: list[dict[str, Any]] = []
+
+    # search 명시 요청은 검색 도구를 우선 강제 실행
+    if ("search" in q_lower) or ("검색" in q):
+        query = _extract_search_query_from_question(q)
+        progress(f"규칙 기반 도구 실행: search.duckduckgo query={query}")
+        try:
+            result = run_tool(
+                "search.duckduckgo",
+                {"query": query, "max_items": 5},
+                log_callback=progress,
+            )
+            used_tools.append({"name": "search.duckduckgo", "args": {"query": query, "max_items": 5}, "ok": True})
+            items = result.get("items", [])
+            if not items:
+                return "검색 결과가 비어 있습니다.", used_tools
+            lines = []
+            for i, item in enumerate(items, start=1):
+                title = str(item.get("title") or "").strip()
+                snippet = str(item.get("snippet") or "").strip()
+                url = str(item.get("url") or "").strip()
+                lines.append(f"{i}. {title}\n- {snippet}\n- {url}")
+            answer = "search 도구 결과 요약:\n\n" + "\n\n".join(lines)
+            return answer, used_tools
+        except Exception as e:
+            used_tools.append(
+                {"name": "search.duckduckgo", "args": {"query": query, "max_items": 5}, "ok": False, "error": str(e)}
+            )
+            progress(f"규칙 기반 search 도구 실패: {e!s}")
+            return None, used_tools
+
+    return None, used_tools
+
+
+def _call_llm_with_tools_loop(
+    *,
+    client: OpenAI,
+    provider: str,
+    model_name: str,
+    system_prompt: str,
+    user_prompt: str,
+    progress: Callable[[str], None],
+    max_turns: int = 4,
+) -> tuple[str, list[dict[str, Any]]]:
+    """
+    OpenAI/vLLM 호환 도구 호출 루프.
+    """
+    tool_defs = _build_openai_tool_defs()
+    messages: list[dict[str, Any]] = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_prompt},
+    ]
+    used_tools: list[dict[str, Any]] = []
+    last_answer = ""
+
+    for turn in range(1, max_turns + 1):
+        completion = client.chat.completions.create(
+            model=model_name,
+            messages=messages,
+            tools=tool_defs,
+            tool_choice="auto",
+            temperature=0.2,
+        )
+        message = completion.choices[0].message
+        last_answer = (message.content or "").strip()
+        tool_calls = list(message.tool_calls or [])
+
+        if not tool_calls:
+            if turn == 1:
+                progress("모델이 tool_call 없이 일반 답변을 생성했습니다.")
+            return last_answer, used_tools
+
+        progress(f"도구 호출 단계 {turn}: {len(tool_calls)}개 tool call 감지")
+
+        assistant_tool_calls: list[dict[str, Any]] = []
+        tool_outputs: list[dict[str, Any]] = []
+        for tc in tool_calls:
+            name = tc.function.name
+            arguments_raw = tc.function.arguments or "{}"
+            tool_call_id = tc.id
+            try:
+                parsed_args = json.loads(arguments_raw) if arguments_raw.strip() else {}
+            except Exception:
+                parsed_args = {}
+
+            progress(f"tool 실행: {name} args={parsed_args}")
+            logger.info(
+                "[TOOL_CALL] provider=%s model=%s name=%s args=%s",
+                provider,
+                model_name,
+                name,
+                json.dumps(parsed_args, ensure_ascii=False),
+            )
+            try:
+                tool_result = run_tool(
+                    name,
+                    parsed_args,
+                    log_callback=progress,
+                )
+                used_tools.append({"name": name, "args": parsed_args, "ok": True})
+            except Exception as e:
+                tool_result = {"ok": False, "error": str(e), "tool_name": name}
+                used_tools.append({"name": name, "args": parsed_args, "ok": False, "error": str(e)})
+
+            assistant_tool_calls.append(
+                {
+                    "id": tool_call_id,
+                    "type": "function",
+                    "function": {"name": name, "arguments": arguments_raw},
+                }
+            )
+            tool_outputs.append(
+                {
+                    "tool_call_id": tool_call_id,
+                    "content": json.dumps(tool_result, ensure_ascii=False),
+                }
+            )
+
+        messages.append(
+            {
+                "role": "assistant",
+                "content": message.content or "",
+                "tool_calls": assistant_tool_calls,
+            }
+        )
+        for tool_output in tool_outputs:
+            messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": tool_output["tool_call_id"],
+                    "content": tool_output["content"],
+                }
+            )
+
+    return last_answer, used_tools
 
 
 def _embedding_full_url(provider: str) -> str:
@@ -104,6 +297,8 @@ def answer_with_rag(
     llm_provider_override: str | None = None,
     embedding_provider_override: str | None = None,
     llm_model_override: str | None = None,
+    use_vector_db: bool = True,
+    use_tools: bool = True,
     progress_callback: Callable[[str], None] | None = None,
 ) -> dict[str, Any]:
     """
@@ -116,6 +311,7 @@ def answer_with_rag(
         llm_provider_override: (선택) 요청 단위 provider 오버라이드 값 (openai | vllm | gemini)
         embedding_provider_override: (선택) 요청 단위 임베딩 provider 오버라이드 값 (openai | vllm | gemini)
         llm_model_override: (선택) 요청 단위 모델명 오버라이드
+        use_vector_db: Vector DB를 사용할지 여부
 
     반환:
         answer: 최종 답변
@@ -157,14 +353,14 @@ def answer_with_rag(
             "error": "llm_provider는 openai, vllm, gemini 중 하나여야 합니다.",
         }
 
-    if embedding_provider not in {"openai", "vllm", "gemini"}:
+    if use_vector_db and embedding_provider not in {"openai", "vllm", "gemini"}:
         return {
             "ok": False,
             "error": "embedding_provider는 openai, vllm, gemini 중 하나여야 합니다.",
         }
 
     _progress(
-        f"RAG 시작: provider={provider}, embedding_provider={embedding_provider}, top_k={top_k}, source={source or '-'}"
+        f"채팅 시작: provider={provider}, embedding_provider={embedding_provider if use_vector_db else '-'}, use_vector_db={use_vector_db}, top_k={top_k}, source={source or '-'}"
     )
 
     # LLM provider가 OpenAI일 때만 OPENAI_API_KEY를 필수로 체크합니다.
@@ -175,104 +371,111 @@ def answer_with_rag(
         }
 
     # 임베딩 provider가 openai라면 OpenAI 키가 필요합니다.
-    if embedding_provider == "openai" and not settings.openai_api_key:
+    if use_vector_db and embedding_provider == "openai" and not settings.openai_api_key:
         return {
             "ok": False,
             "error": "OPENAI_API_KEY가 없어 질문 임베딩을 만들 수 없습니다.",
         }
 
-    if embedding_provider == "gemini" and not settings.gemini_api_key:
+    if use_vector_db and embedding_provider == "gemini" and not settings.gemini_api_key:
         return {
             "ok": False,
             "error": "GEMINI_API_KEY가 없어 Gemini 임베딩을 만들 수 없습니다.",
         }
 
-    # 1) 질문을 임베딩해서 벡터로 변환합니다.
-    t0 = time.perf_counter()
-    _progress("1/3 질문 임베딩 생성 중...")
-    logger.debug(
-        "[RAG_STEP_START] step=embed_question provider=%s full_url=%s question_len=%s",
-        embedding_provider,
-        _embedding_full_url(embedding_provider),
-        len(question),
-    )
-    try:
-        query_vector = embed_single(question, provider=embedding_provider)
-    except APITimeoutError:
-        timeout_sec = (
-            settings.vllm_timeout_sec if embedding_provider == "vllm" else settings.openai_timeout_sec
-        )
-        return {
-            "ok": False,
-            "error": (
-                "질문 임베딩 생성이 timeout 되었습니다. "
-                f"embedding_provider={embedding_provider}, timeout_sec={timeout_sec}"
-            ),
-        }
-    except httpx.TimeoutException:
-        return {
-            "ok": False,
-            "error": (
-                "질문 임베딩 생성이 timeout 되었습니다. "
-                f"embedding_provider={embedding_provider}, timeout_sec={settings.gemini_timeout_sec}"
-            ),
-        }
-    if not query_vector:
-        return {"ok": False, "error": "질문 임베딩 생성에 실패했습니다."}
-    _progress(f"1/3 질문 임베딩 완료 (dim={len(query_vector)})")
-    logger.debug(
-        "[RAG_STEP_DONE] step=embed_question provider=%s vector_dim=%s elapsed_ms=%.1f",
-        embedding_provider,
-        len(query_vector),
-        (time.perf_counter() - t0) * 1000,
-    )
+    hits: list[dict[str, Any]] = []
+    context = ""
 
-    # 2) Qdrant에서 유사한 청크를 검색합니다.
-    #    연결 실패 시 "어디로 붙으려 했는지(host/port)"를 같이 반환해 진단을 쉽게 합니다.
-    t1 = time.perf_counter()
-    _progress("2/3 Qdrant 유사도 검색 중...")
-    logger.debug(
-        "[RAG_STEP_START] step=qdrant_search host=%s port=%s collection=%s top_k=%s source=%s",
-        settings.qdrant_host,
-        settings.qdrant_port,
-        settings.qdrant_collection,
-        top_k,
-        source or "",
-    )
-    try:
-        qdrant = get_qdrant_client()
-        # 컬렉션이 아직 없으면(초기 상태) 자동으로 생성해 404를 방지합니다.
-        # 벡터 차원은 현재 질문 임베딩 벡터 길이에 맞춥니다.
-        ensure_collection(
-            client=qdrant,
-            collection_name=settings.qdrant_collection,
-            dim=len(query_vector),
+    if use_vector_db:
+        # 1) 질문을 임베딩해서 벡터로 변환합니다.
+        t0 = time.perf_counter()
+        _progress("1/3 질문 임베딩 생성 중...")
+        logger.debug(
+            "[RAG_STEP_START] step=embed_question provider=%s full_url=%s question_len=%s",
+            embedding_provider,
+            _embedding_full_url(embedding_provider),
+            len(question),
         )
-        hits = search_similar(
-            client=qdrant,
-            collection_name=settings.qdrant_collection,
-            query_vector=query_vector,
-            top_k=top_k,
-            source=source,
+        try:
+            query_vector = embed_single(question, provider=embedding_provider)
+        except APITimeoutError:
+            timeout_sec = (
+                settings.vllm_timeout_sec if embedding_provider == "vllm" else settings.openai_timeout_sec
+            )
+            return {
+                "ok": False,
+                "error": (
+                    "질문 임베딩 생성이 timeout 되었습니다. "
+                    f"embedding_provider={embedding_provider}, timeout_sec={timeout_sec}"
+                ),
+            }
+        except httpx.TimeoutException:
+            return {
+                "ok": False,
+                "error": (
+                    "질문 임베딩 생성이 timeout 되었습니다. "
+                    f"embedding_provider={embedding_provider}, timeout_sec={settings.gemini_timeout_sec}"
+                ),
+            }
+        if not query_vector:
+            return {"ok": False, "error": "질문 임베딩 생성에 실패했습니다."}
+        _progress(f"1/3 질문 임베딩 완료 (dim={len(query_vector)})")
+        logger.debug(
+            "[RAG_STEP_DONE] step=embed_question provider=%s vector_dim=%s elapsed_ms=%.1f",
+            embedding_provider,
+            len(query_vector),
+            (time.perf_counter() - t0) * 1000,
         )
-    except Exception as e:
-        return {
-            "ok": False,
-            "error": (
-                "Qdrant 검색 중 연결 오류가 발생했습니다. "
-                f"target={settings.qdrant_host}:{settings.qdrant_port}, "
-                f"collection={settings.qdrant_collection}, detail={e!s}"
-            ),
-        }
-    _progress(f"2/3 Qdrant 검색 완료 (hits={len(hits)})")
-    logger.debug(
-        "[RAG_STEP_DONE] step=qdrant_search hits=%s elapsed_ms=%.1f",
-        len(hits),
-        (time.perf_counter() - t1) * 1000,
-    )
 
-    # 3) 검색 결과에서 LLM에 넣을 컨텍스트를 구성합니다.
-    context = build_context_from_hits(hits)
+        # 2) Qdrant에서 유사한 청크를 검색합니다.
+        #    연결 실패 시 "어디로 붙으려 했는지(host/port)"를 같이 반환해 진단을 쉽게 합니다.
+        t1 = time.perf_counter()
+        _progress("2/3 Qdrant 유사도 검색 중...")
+        logger.debug(
+            "[RAG_STEP_START] step=qdrant_search host=%s port=%s collection=%s top_k=%s source=%s",
+            settings.qdrant_host,
+            settings.qdrant_port,
+            settings.qdrant_collection,
+            top_k,
+            source or "",
+        )
+        try:
+            qdrant = get_qdrant_client()
+            # 컬렉션이 아직 없으면(초기 상태) 자동으로 생성해 404를 방지합니다.
+            # 벡터 차원은 현재 질문 임베딩 벡터 길이에 맞춥니다.
+            ensure_collection(
+                client=qdrant,
+                collection_name=settings.qdrant_collection,
+                dim=len(query_vector),
+            )
+            hits = search_similar(
+                client=qdrant,
+                collection_name=settings.qdrant_collection,
+                query_vector=query_vector,
+                top_k=top_k,
+                source=source,
+            )
+        except Exception as e:
+            return {
+                "ok": False,
+                "error": (
+                    "Qdrant 검색 중 연결 오류가 발생했습니다. "
+                    f"target={settings.qdrant_host}:{settings.qdrant_port}, "
+                    f"collection={settings.qdrant_collection}, detail={e!s}"
+                ),
+            }
+        _progress(f"2/3 Qdrant 검색 완료 (hits={len(hits)})")
+        logger.debug(
+            "[RAG_STEP_DONE] step=qdrant_search hits=%s elapsed_ms=%.1f",
+            len(hits),
+            (time.perf_counter() - t1) * 1000,
+        )
+
+        # 3) 검색 결과에서 LLM에 넣을 컨텍스트를 구성합니다.
+        context = build_context_from_hits(hits)
+    else:
+        source = None
+        _progress("Vector DB 사용 안 함: 질문 원문만 LLM에 전달합니다.")
 
     # 4) LLM에게 “문서 컨텍스트 기반으로 답변”하도록 요청합니다.
     #    - 아직 스트리밍/툴 호출은 하지 않고, 가장 단순한 형태로 구현합니다.
@@ -321,7 +524,7 @@ def answer_with_rag(
 
     # source가 있으면 RAG 컨텍스트 기반 프롬프트를 사용하고,
     # source가 비어 있으면 사용자가 입력한 질문 원문만 그대로 전달합니다.
-    if source:
+    if use_vector_db and source:
         system_prompt = (
             "너는 문서 기반 질의응답 도우미다.\n"
             "사용자가 질문하면, 제공된 문서 컨텍스트 안에서만 근거를 찾아 답변한다.\n"
@@ -369,6 +572,8 @@ def answer_with_rag(
             )
             _progress(f"vLLM 요청 전송: url={full_url}")
             _emit_payload_chunks("[vLLM_PAYLOAD]", payload_json)
+
+    used_tools: list[dict[str, Any]] = []
 
     if provider == "gemini":
         gemini_payload = {
@@ -439,15 +644,55 @@ def answer_with_rag(
         answer = answer.strip()
     else:
         try:
-            completion = client.chat.completions.create(
-                model=model_name,
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt},
-                ],
-                temperature=0.2,  # 너무 창의적이지 않게(근거 기반 답변 유도)
-            )
-            answer = (completion.choices[0].message.content or "").strip()
+            # source 미지정 일반 질의는 도구 호출 루프를 우선 시도
+            if use_tools and not source:
+                shortcut_answer, shortcut_tools = _run_rule_based_tool_shortcuts(
+                    question=question,
+                    progress=_progress,
+                )
+                if shortcut_answer is not None:
+                    answer = shortcut_answer
+                    used_tools = shortcut_tools
+                else:
+                    try:
+                        answer, used_tools = _call_llm_with_tools_loop(
+                            client=client,
+                            provider=provider,
+                            model_name=model_name,
+                            system_prompt=system_prompt,
+                            user_prompt=user_prompt,
+                            progress=_progress,
+                        )
+                    except Exception as tool_loop_error:
+                        logger.warning(
+                            "[TOOL_LOOP_FALLBACK] provider=%s model=%s detail=%s",
+                            provider,
+                            model_name,
+                            tool_loop_error,
+                        )
+                        _progress(
+                            f"도구 호출 루프 실패로 일반 답변으로 전환: {tool_loop_error!s}"
+                        )
+                        completion = client.chat.completions.create(
+                            model=model_name,
+                            messages=[
+                                {"role": "system", "content": system_prompt},
+                                {"role": "user", "content": user_prompt},
+                            ],
+                            temperature=0.2,
+                        )
+                        answer = (completion.choices[0].message.content or "").strip()
+            else:
+                completion = client.chat.completions.create(
+                    model=model_name,
+                    messages=[
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_prompt},
+                    ],
+                    temperature=0.2,  # 너무 창의적이지 않게(근거 기반 답변 유도)
+                )
+                answer = (completion.choices[0].message.content or "").strip()
+
             if provider == "vllm":
                 answer = _strip_vllm_think_prefix(answer)
         except APIConnectionError as e:
@@ -524,8 +769,10 @@ def answer_with_rag(
         "used_source_filter": source or "",
         "used_llm_provider": provider,
         "used_llm_model": model_name,
-        "used_embedding_provider": embedding_provider,
-        "collection": settings.qdrant_collection,
+        "used_embedding_provider": embedding_provider if use_vector_db else "",
+        "used_vector_db": use_vector_db,
+        "used_tools": used_tools,
+        "collection": settings.qdrant_collection if use_vector_db else "",
     }
 
 

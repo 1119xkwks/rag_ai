@@ -25,6 +25,8 @@ type ChatAskResponse = {
   ok: boolean;
   answer?: string;
   contexts?: RagContextHit[];
+  used_tools?: UsedToolHit[];
+  used_vector_db?: boolean;
   error?: string;
 };
 
@@ -32,6 +34,13 @@ type ChatModelsResponse = {
   ok: boolean;
   provider: string;
   models: string[];
+  error?: string;
+};
+
+type UsedToolHit = {
+  name: string;
+  args?: Record<string, unknown>;
+  ok?: boolean;
   error?: string;
 };
 
@@ -51,6 +60,8 @@ export default function ChatPage() {
   const [modelsError, setModelsError] = useState("");
   const [embeddingProvider, setEmbeddingProvider] =
     useState<ChatEmbeddingProvider>("gemini");
+  const [useVectorDb, setUseVectorDb] = useState(false);
+  const [useTools, setUseTools] = useState(true);
   const [isLoading, setIsLoading] = useState(false);
   const [askLogs, setAskLogs] = useState<string[]>([]);
 
@@ -64,6 +75,7 @@ export default function ChatPage() {
   ]);
 
   const [contexts, setContexts] = useState<RagContextHit[]>([]);
+  const [usedTools, setUsedTools] = useState<UsedToolHit[]>([]);
   const lastAssistantIdRef = useRef<string | null>(null);
 
   const canSubmit = useMemo(() => {
@@ -135,11 +147,13 @@ export default function ChatPage() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           question: q,
-          top_k: topK,
-          source: source.trim(),
+          top_k: useVectorDb ? topK : 5,
+          source: useVectorDb ? source.trim() : "",
           llm_provider: llmProvider,
           llm_model: llmModel,
-          embedding_provider: embeddingProvider,
+          embedding_provider: useVectorDb ? embeddingProvider : "",
+          use_vector_db: useVectorDb,
+          use_tools: useTools,
         }),
       });
 
@@ -154,6 +168,7 @@ export default function ChatPage() {
         lastAssistantIdRef.current = assistantMsg.id;
         setMessages((prev) => [...prev, assistantMsg]);
         setContexts([]);
+        setUsedTools([]);
         return;
       }
 
@@ -188,6 +203,7 @@ export default function ChatPage() {
                 lastAssistantIdRef.current = assistantMsg.id;
                 setMessages((prev) => [...prev, assistantMsg]);
                 setContexts([]);
+                setUsedTools([]);
               } else {
                 const assistantMsg: ChatMessage = {
                   id: crypto.randomUUID(),
@@ -197,6 +213,7 @@ export default function ChatPage() {
                 lastAssistantIdRef.current = assistantMsg.id;
                 setMessages((prev) => [...prev, assistantMsg]);
                 setContexts(payload.contexts || []);
+                setUsedTools(payload.used_tools || []);
               }
             } else if (payload.type === "error") {
               const assistantMsg: ChatMessage = {
@@ -207,6 +224,7 @@ export default function ChatPage() {
               lastAssistantIdRef.current = assistantMsg.id;
               setMessages((prev) => [...prev, assistantMsg]);
               setContexts([]);
+              setUsedTools([]);
             }
           } catch {
             // ignore parse error for partial chunk
@@ -232,6 +250,7 @@ export default function ChatPage() {
                 lastAssistantIdRef.current = assistantMsg.id;
                 setMessages((prev) => [...prev, assistantMsg]);
                 setContexts([]);
+                setUsedTools([]);
               } else {
                 const assistantMsg: ChatMessage = {
                   id: crypto.randomUUID(),
@@ -241,6 +260,7 @@ export default function ChatPage() {
                 lastAssistantIdRef.current = assistantMsg.id;
                 setMessages((prev) => [...prev, assistantMsg]);
                 setContexts(payload.contexts || []);
+                setUsedTools(payload.used_tools || []);
               }
             } else if (payload.type === "error") {
               const assistantMsg: ChatMessage = {
@@ -251,6 +271,7 @@ export default function ChatPage() {
               lastAssistantIdRef.current = assistantMsg.id;
               setMessages((prev) => [...prev, assistantMsg]);
               setContexts([]);
+              setUsedTools([]);
             }
           } catch {
             // ignore
@@ -266,6 +287,7 @@ export default function ChatPage() {
       lastAssistantIdRef.current = assistantMsg.id;
       setMessages((prev) => [...prev, assistantMsg]);
       setContexts([]);
+      setUsedTools([]);
     } finally {
       setIsLoading(false);
     }
@@ -339,10 +361,11 @@ export default function ChatPage() {
                     source(선택)
                   </span>
                   <input
-                    className="h-10 rounded-xl border border-zinc-200 bg-white px-3 text-sm outline-none focus:border-zinc-400 dark:border-zinc-800 dark:bg-zinc-950 dark:focus:border-zinc-600"
+                    className="h-10 rounded-xl border border-zinc-200 bg-white px-3 text-sm outline-none focus:border-zinc-400 disabled:cursor-not-allowed disabled:bg-zinc-100 dark:border-zinc-800 dark:bg-zinc-950 dark:focus:border-zinc-600 dark:disabled:bg-zinc-900"
                     value={source}
                     onChange={(e) => setSource(e.target.value)}
                     placeholder="예: my.pdf (비우면 전체)"
+                    disabled={!useVectorDb}
                   />
                 </label>
 
@@ -351,12 +374,13 @@ export default function ChatPage() {
                     top_k
                   </span>
                   <input
-                    className="h-10 rounded-xl border border-zinc-200 bg-white px-3 text-sm outline-none focus:border-zinc-400 dark:border-zinc-800 dark:bg-zinc-950 dark:focus:border-zinc-600"
+                    className="h-10 rounded-xl border border-zinc-200 bg-white px-3 text-sm outline-none focus:border-zinc-400 disabled:cursor-not-allowed disabled:bg-zinc-100 dark:border-zinc-800 dark:bg-zinc-950 dark:focus:border-zinc-600 dark:disabled:bg-zinc-900"
                     type="number"
                     min={1}
                     max={20}
                     value={topK}
                     onChange={(e) => setTopK(Number(e.target.value))}
+                    disabled={!useVectorDb}
                   />
                 </label>
 
@@ -404,16 +428,37 @@ export default function ChatPage() {
                     Embedding provider
                   </span>
                   <select
-                    className="h-10 rounded-xl border border-zinc-200 bg-white px-3 text-sm outline-none focus:border-zinc-400 dark:border-zinc-800 dark:bg-zinc-950 dark:focus:border-zinc-600"
+                    className="h-10 rounded-xl border border-zinc-200 bg-white px-3 text-sm outline-none focus:border-zinc-400 disabled:cursor-not-allowed disabled:bg-zinc-100 dark:border-zinc-800 dark:bg-zinc-950 dark:focus:border-zinc-600 dark:disabled:bg-zinc-900"
                     value={embeddingProvider}
                     onChange={(e) =>
                       setEmbeddingProvider(e.target.value as ChatEmbeddingProvider)
                     }
+                    disabled={!useVectorDb}
                   >
                     <option value="vllm">vLLM (내부 서버)</option>
                     <option value="openai">OpenAI</option>
                     <option value="gemini">Gemini</option>
                   </select>
+                </label>
+                <label className="flex items-center gap-2 text-sm md:col-span-5">
+                  <input
+                    type="checkbox"
+                    checked={useVectorDb}
+                    onChange={(e) => setUseVectorDb(e.target.checked)}
+                  />
+                  <span>
+                    Vector DB 사용 (체크 시 임베딩 생성 후 문서 검색, 기본 해제)
+                  </span>
+                </label>
+                <label className="flex items-center gap-2 text-sm md:col-span-5">
+                  <input
+                    type="checkbox"
+                    checked={useTools}
+                    onChange={(e) => setUseTools(e.target.checked)}
+                  />
+                  <span>
+                    도구 사용 허용 (source 미지정 일반 질의에서 `maths` / `search` / `current time` 도구 호출)
+                  </span>
                 </label>
               </div>
 
@@ -440,7 +485,7 @@ export default function ChatPage() {
               </div>
 
               <p className="mt-3 text-xs text-zinc-500">
-                팁: `/ingest`에서 문서를 먼저 인입하면 source 기준 검색이 가능합니다.
+                팁: Vector DB를 켠 뒤 `/ingest`에서 문서를 먼저 인입하면 source 기준 검색이 가능합니다.
               </p>
               {askLogs.length > 0 ? (
                 <div className="mt-3">
@@ -504,6 +549,45 @@ export default function ChatPage() {
 
             <div className="mt-4 text-[11px] text-zinc-500">
               last assistant message id: {lastAssistantIdRef.current || "-"}
+            </div>
+          </div>
+          <div className="mt-4 rounded-2xl border border-zinc-200 bg-white p-4 dark:border-zinc-800 dark:bg-zinc-950">
+            <h2 className="text-sm font-semibold">도구 사용 가이드</h2>
+            <div className="mt-2 space-y-2 text-xs text-zinc-600 dark:text-zinc-400">
+              <p>- 일반 질의(source 비움)에서 도구를 자동 선택해 호출합니다.</p>
+              <p>- 예: 복리 계산, 현재 시간, 인물 검색/요약.</p>
+              <p>- source를 지정한 RAG 질의는 문서 컨텍스트 우선으로 동작합니다.</p>
+            </div>
+            <h3 className="mt-4 text-xs font-semibold text-zinc-700 dark:text-zinc-300">
+              최근 응답에서 사용된 도구
+            </h3>
+            <div className="mt-2 flex flex-col gap-2">
+              {usedTools.length === 0 ? (
+                <div className="rounded-xl bg-zinc-50 p-3 text-xs text-zinc-600 dark:bg-zinc-900 dark:text-zinc-400">
+                  사용된 도구가 없습니다.
+                </div>
+              ) : (
+                usedTools.map((tool, i) => (
+                  <div
+                    key={`${tool.name}-${i}`}
+                    className="rounded-xl border border-zinc-200 p-3 text-xs dark:border-zinc-800"
+                  >
+                    <div className="font-medium text-zinc-800 dark:text-zinc-200">
+                      {tool.name} {tool.ok === false ? "(실패)" : "(성공)"}
+                    </div>
+                    {tool.args ? (
+                      <pre className="mt-1 overflow-x-auto text-[11px] text-zinc-600 dark:text-zinc-400">
+                        {JSON.stringify(tool.args, null, 2)}
+                      </pre>
+                    ) : null}
+                    {tool.error ? (
+                      <div className="mt-1 text-[11px] text-red-600 dark:text-red-400">
+                        {tool.error}
+                      </div>
+                    ) : null}
+                  </div>
+                ))
+              )}
             </div>
           </div>
         </aside>

@@ -55,6 +55,9 @@ class ChatAskRequest(BaseModel):
         "",
         description="(선택) Embedding provider override (openai | vllm | gemini)",
     )
+    use_vector_db: bool = Field(False, description="Vector DB 사용 여부")
+    # (선택) source 미지정 일반 질의에서 tool-calling 사용 여부
+    use_tools: bool = Field(True, description="tool-calling 사용 여부")
 
 
 @router.post("/ask")
@@ -72,12 +75,14 @@ async def chat_ask(req: ChatAskRequest) -> dict:
         - contexts: 근거로 사용된 문서 청크들(검색 결과)
     """
     logger.debug(
-        "[CHAT_ASK] question_len=%s top_k=%s source=%s llm_provider=%s embedding_provider=%s",
+        "[CHAT_ASK] question_len=%s top_k=%s source=%s llm_provider=%s embedding_provider=%s use_vector_db=%s use_tools=%s",
         len(req.question or ""),
         req.top_k,
         req.source or "",
         req.llm_provider or "",
         req.embedding_provider or "",
+        req.use_vector_db,
+        req.use_tools,
     )
 
     result = answer_with_rag(
@@ -87,6 +92,8 @@ async def chat_ask(req: ChatAskRequest) -> dict:
         llm_provider_override=req.llm_provider.strip() or None,
         embedding_provider_override=req.embedding_provider.strip() or None,
         llm_model_override=req.llm_model.strip() or None,
+        use_vector_db=req.use_vector_db,
+        use_tools=req.use_tools,
     )
 
     logger.debug(
@@ -114,7 +121,7 @@ async def chat_ask_stream(req: ChatAskRequest):
         log_queue.put(("LOG", f"{now} | INFO | rag_ai.api.chat | {message}"))
 
     push_log(
-        f"[ask-stream] 시작. question_len={len(req.question or '')}, top_k={req.top_k}, source={req.source or '-'}, llm_provider={req.llm_provider or '-'}, embedding_provider={req.embedding_provider or '-'}"
+        f"[ask-stream] 시작. question_len={len(req.question or '')}, top_k={req.top_k}, source={req.source or '-'}, llm_provider={req.llm_provider or '-'}, embedding_provider={req.embedding_provider or '-'}, use_vector_db={req.use_vector_db}, use_tools={req.use_tools}"
     )
 
     def run_ask() -> None:
@@ -126,6 +133,8 @@ async def chat_ask_stream(req: ChatAskRequest):
                 llm_provider_override=req.llm_provider.strip() or None,
                 embedding_provider_override=req.embedding_provider.strip() or None,
                 llm_model_override=req.llm_model.strip() or None,
+                use_vector_db=req.use_vector_db,
+                use_tools=req.use_tools,
                 progress_callback=push_log,
             )
             result_holder.append(("RESULT", result))
