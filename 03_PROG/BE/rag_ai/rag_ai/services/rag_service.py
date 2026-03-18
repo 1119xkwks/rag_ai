@@ -11,7 +11,6 @@ from typing import Any, List
 import httpx
 import json
 import logging
-import re
 import time
 from openai import APIConnectionError
 from openai import APITimeoutError
@@ -68,47 +67,52 @@ def _build_openai_tool_defs() -> list[dict[str, Any]]:
     return defs
 
 
-def _extract_search_query_from_question(question: str) -> str:
+def _extract_action_json(text: str) -> dict[str, Any] | None:
     """
-    사용자의 검색 요청 문장에서 실제 검색어를 추출합니다.
+    LLM 텍스트 답변에서 {action, action_input} 형태 JSON을 추출합니다.
     """
-    q = (question or "").strip()
-    if not q:
-        return ""
-    patterns = [
-        r"^\s*search\s*를\s*이용해서\s*",
-        r"^\s*search를\s*이용해서\s*",
-        r"^\s*검색해서\s*",
-        r"^\s*검색\s*해줘\s*",
-    ]
-    cleaned = q
-    for p in patterns:
-        cleaned = re.sub(p, "", cleaned, flags=re.IGNORECASE)
-    cleaned = re.sub(
-        r"\s*(알려줘|알려주세요|찾아줘|찾아주세요|설명해줘|설명해주세요)\s*[.!?…]*\s*$",
-        "",
-        cleaned,
-    ).strip()
-    return cleaned or q
+    raw = (text or "").strip()
+    if not raw:
+        return None
+
+    # ```json ... ``` 코드펜스 처리
+    if raw.startswith("```"):
+        lines = raw.splitlines()
+        if len(lines) >= 3 and lines[0].startswith("```") and lines[-1].strip() == "```":
+            raw = "\n".join(lines[1:-1]).strip()
+
+    start = raw.find("{")
+    end = raw.rfind("}")
+    if start < 0 or end <= start:
+        return None
+    candidate = raw[start : end + 1]
+    try:
+        parsed = json.loads(candidate)
+    except Exception:
+        return None
+    if not isinstance(parsed, dict):
+        return None
+    if "action" not in parsed:
+        return None
+    return parsed
 
 
-def _run_rule_based_tool_shortcuts(
-    *,
-    question: str,
+def _run_action_json_tool(
+    action_payload: dict[str, Any],
     progress: Callable[[str], None],
 ) -> tuple[str | None, list[dict[str, Any]]]:
     """
-    모델이 tool_call을 잘 못 내는 경우를 위해,
-    명시적인 요청 패턴에 대해 도구를 강제 실행하는 fallback.
+    {action, action_input} 형태를 실제 도구 실행으로 변환합니다.
     """
-    q = (question or "").strip()
-    q_lower = q.lower()
+    action = str(action_payload.get("action") or "").strip().lower()
+    action_input = action_payload.get("action_input")
     used_tools: list[dict[str, Any]] = []
 
-    # search 명시 요청은 검색 도구를 우선 강제 실행
-    if ("search" in q_lower) or ("검색" in q):
-        query = _extract_search_query_from_question(q)
-        progress(f"규칙 기반 도구 실행: search.duckduckgo query={query}")
+    if action in {"search", "duckduckgo", "search.duckduckgo"}:
+        query = str(action_input or "").strip()
+        if not query:
+            return None, used_tools
+        progress(f"action-json 도구 실행: search.duckduckgo query={query}")
         try:
             result = run_tool(
                 "search.duckduckgo",
@@ -125,13 +129,12 @@ def _run_rule_based_tool_shortcuts(
                 snippet = str(item.get("snippet") or "").strip()
                 url = str(item.get("url") or "").strip()
                 lines.append(f"{i}. {title}\n- {snippet}\n- {url}")
-            answer = "search 도구 결과 요약:\n\n" + "\n\n".join(lines)
-            return answer, used_tools
+            return "search 도구 결과 요약:\n\n" + "\n\n".join(lines), used_tools
         except Exception as e:
             used_tools.append(
                 {"name": "search.duckduckgo", "args": {"query": query, "max_items": 5}, "ok": False, "error": str(e)}
             )
-            progress(f"규칙 기반 search 도구 실패: {e!s}")
+            progress(f"action-json search 도구 실패: {e!s}")
             return None, used_tools
 
     return None, used_tools
@@ -645,44 +648,40 @@ def answer_with_rag(
     else:
         try:
             # source 미지정 일반 질의는 도구 호출 루프를 우선 시도
-            if use_tools and not source:
-                shortcut_answer, shortcut_tools = _run_rule_based_tool_shortcuts(
-                    question=question,
-                    progress=_progress,
-                )
-                if shortcut_answer is not None:
-                    answer = shortcut_answer
-                    used_tools = shortcut_tools
-                else:
-                    try:
-                        answer, used_tools = _call_llm_with_tools_loop(
-                            client=client,
-                            provider=provider,
-                            model_name=model_name,
-                            system_prompt=system_prompt,
-                            user_prompt=user_prompt,
-                            progress=_progress,
-                        )
-                    except Exception as tool_loop_error:
-                        logger.warning(
-                            "[TOOL_LOOP_FALLBACK] provider=%s model=%s detail=%s",
-                            provider,
-                            model_name,
-                            tool_loop_error,
-                        )
-                        _progress(
-                            f"도구 호출 루프 실패로 일반 답변으로 전환: {tool_loop_error!s}"
-                        )
-                        completion = client.chat.completions.create(
-                            model=model_name,
-                            messages=[
-                                {"role": "system", "content": system_prompt},
-                                {"role": "user", "content": user_prompt},
-                            ],
-                            temperature=0.2,
-                        )
-                        answer = (completion.choices[0].message.content or "").strip()
+            if use_tools and not source and provider == "openai":
+                try:
+                    answer, used_tools = _call_llm_with_tools_loop(
+                        client=client,
+                        provider=provider,
+                        model_name=model_name,
+                        system_prompt=system_prompt,
+                        user_prompt=user_prompt,
+                        progress=_progress,
+                    )
+                except Exception as tool_loop_error:
+                    logger.warning(
+                        "[TOOL_LOOP_FALLBACK] provider=%s model=%s detail=%s",
+                        provider,
+                        model_name,
+                        tool_loop_error,
+                    )
+                    _progress(
+                        f"도구 호출 루프 실패로 일반 답변으로 전환: {tool_loop_error!s}"
+                    )
+                    completion = client.chat.completions.create(
+                        model=model_name,
+                        messages=[
+                            {"role": "system", "content": system_prompt},
+                            {"role": "user", "content": user_prompt},
+                        ],
+                        temperature=0.2,
+                    )
+                    answer = (completion.choices[0].message.content or "").strip()
             else:
+                if use_tools and not source and provider != "openai":
+                    _progress(
+                        f"현재 provider({provider})는 OpenAI tool-call 루프를 건너뜁니다. 일반 답변 후 action-json 보완 경로 사용"
+                    )
                 completion = client.chat.completions.create(
                     model=model_name,
                     messages=[
@@ -695,6 +694,22 @@ def answer_with_rag(
 
             if provider == "vllm":
                 answer = _strip_vllm_think_prefix(answer)
+
+            # vLLM 등에서 tool-call 미지원 시, action JSON 텍스트를 실제 도구 실행으로 보완
+            if use_tools and not source and not used_tools:
+                action_payload = _extract_action_json(answer)
+                if action_payload is not None:
+                    _progress(
+                        f"action-json 감지: action={action_payload.get('action')}, 실제 도구 실행 시도"
+                    )
+                    action_answer, action_tools = _run_action_json_tool(
+                        action_payload,
+                        _progress,
+                    )
+                    if action_answer is not None:
+                        answer = action_answer
+                    if action_tools:
+                        used_tools = action_tools
         except APIConnectionError as e:
             # 내부망 LLM 서버(vLLM) 접근 실패 시 원인 파악이 쉽도록 endpoint 정보를 포함해 반환
             # 예: VPN 미연결, 방화벽 차단, 서버 down, 잘못된 IP/포트

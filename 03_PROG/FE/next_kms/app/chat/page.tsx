@@ -50,6 +50,13 @@ function safeString(value: unknown): string {
 }
 
 export default function ChatPage() {
+  const toolPromptExamples = [
+    "search 도구를 사용해서 이순신 장군의 약력을 알려줘",
+    "현재 시간 도구를 사용해서 서울 시간을 알려줘",
+    "복리 계산 도구로 원금 100만원, 연 5%, 10년 결과를 계산해줘",
+    "세종대왕 사망연도를 검색하고 현재 기준 몇 년 지났는지 계산해줘",
+  ];
+
   const [question, setQuestion] = useState("");
   const [source, setSource] = useState("");
   const [topK, setTopK] = useState(5);
@@ -554,9 +561,24 @@ export default function ChatPage() {
           <div className="mt-4 rounded-2xl border border-zinc-200 bg-white p-4 dark:border-zinc-800 dark:bg-zinc-950">
             <h2 className="text-sm font-semibold">도구 사용 가이드</h2>
             <div className="mt-2 space-y-2 text-xs text-zinc-600 dark:text-zinc-400">
-              <p>- 일반 질의(source 비움)에서 도구를 자동 선택해 호출합니다.</p>
-              <p>- 예: 복리 계산, 현재 시간, 인물 검색/요약.</p>
+              <p>- 도구를 쓰려면 `도구 사용 허용`을 켜고 `source`를 비워두세요.</p>
+              <p>- 요청은 "무엇을 어떤 도구로 할지"를 자연어로 명확히 적어주세요.</p>
               <p>- source를 지정한 RAG 질의는 문서 컨텍스트 우선으로 동작합니다.</p>
+            </div>
+            <h3 className="mt-4 text-xs font-semibold text-zinc-700 dark:text-zinc-300">
+              빠른 예시 (클릭 시 입력)
+            </h3>
+            <div className="mt-2 flex flex-wrap gap-2">
+              {toolPromptExamples.map((example, i) => (
+                <button
+                  key={i}
+                  type="button"
+                  className="rounded-lg border border-zinc-200 px-2 py-1 text-[11px] text-zinc-700 hover:bg-zinc-50 dark:border-zinc-700 dark:text-zinc-300 dark:hover:bg-zinc-900"
+                  onClick={() => setQuestion(example)}
+                >
+                  {example}
+                </button>
+              ))}
             </div>
             <h3 className="mt-4 text-xs font-semibold text-zinc-700 dark:text-zinc-300">
               최근 응답에서 사용된 도구
